@@ -3,7 +3,6 @@
 Ported from Korg.jl/src/ContinuumAbsorption/absorption_He.jl.
 """
 import numpy as np
-import jax.numpy as jnp
 from ..constants import c_cgs, kboltz_cgs, kboltz_eV
 
 
@@ -63,27 +62,26 @@ def Heminus_ff(nus, T, nHe_I_div_U, ne):
     nHe_I_div_U : n(He I) / U(He I)
     ne : electron number density
     """
-    nus = jnp.asarray(nus)
+    nus = np.asarray(nus)
     theta = 5040.0 / T
     lambdas_A = c_cgs * 1e8 / nus  # Angstrom
 
-    # Bounds check: only valid for certain lambda and theta
     lam_min, lam_max = _lambda_nodes[0], _lambda_nodes[-1]
     th_min, th_max = _theta_nodes[0], _theta_nodes[-1]
-    in_bounds = ((lambdas_A >= lam_min) & (lambdas_A <= lam_max)
-                 & (theta >= th_min) & (theta <= th_max))
 
-    # Interpolate using NumPy, then convert
     lam_np = np.asarray(lambdas_A)
-    K_vals = np.zeros_like(lam_np)
-    for k in range(len(lam_np)):
-        if lam_min <= lam_np[k] <= lam_max and th_min <= theta <= th_max:
-            K_vals[k] = _interp_ff(lam_np[k], theta)
 
-    K = jnp.array(K_vals) * 1e-26  # cm^4/dyn
+    # Vectorized interpolation (no Python loop)
+    if th_min <= theta <= th_max:
+        K_vals = _interp_ff(lam_np, theta)
+        in_bounds = (lam_np >= lam_min) & (lam_np <= lam_max)
+        K_vals = np.where(in_bounds, K_vals, 0.0)
+    else:
+        K_vals = np.zeros_like(lam_np)
+
+    K = np.array(K_vals) * 1e-26  # cm^4/dyn
 
     Pe = ne * kboltz_cgs * T
-    # Ground state of He I: g=1, E=0
-    nHe_I_gs = nHe_I_div_U * 1.0  # g_1 * exp(-0/kT) = 1
+    nHe_I_gs = nHe_I_div_U * 1.0
 
     return K * nHe_I_gs * Pe

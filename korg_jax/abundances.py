@@ -17,8 +17,10 @@ def format_A_X(default_metals_H=0.0, default_alpha_H=None, abundances=None,
 
     Parameters
     ----------
-    default_metals_H : float
+    default_metals_H : float or dict
         [metals/H] for elements heavier than He.
+        If a dict is passed, it is treated as per-element abundance overrides
+        (convenience shorthand for ``format_A_X(0.0, abundances=dict)``).
     default_alpha_H : float or None
         [alpha/H]. Defaults to default_metals_H.
     abundances : dict or None
@@ -35,6 +37,10 @@ def format_A_X(default_metals_H=0.0, default_alpha_H=None, abundances=None,
     -------
     np.ndarray of shape (92,)
     """
+    # Convenience: format_A_X({"Ni": 1.0}) -> format_A_X(0.0, abundances={"Ni": 1.0})
+    if isinstance(default_metals_H, dict):
+        abundances = default_metals_H
+        default_metals_H = 0.0
     if default_alpha_H is None:
         default_alpha_H = default_metals_H
     if abundances is None:

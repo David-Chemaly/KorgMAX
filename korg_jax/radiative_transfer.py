@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import math
 import numpy as np
-import jax.numpy as jnp
 from numpy.polynomial.legendre import leggauss
 
 from .constants import c_cgs
@@ -66,8 +65,22 @@ def compute_tau_anchored(alpha, integrand_factor, log_tau_ref):
     integrand = alpha * integrand_factor
     dlog = log_tau_ref[1:] - log_tau_ref[:-1]
     trap = 0.5 * (integrand[1:] + integrand[:-1]) * dlog
-    tau = jnp.concatenate([jnp.zeros(1), jnp.cumsum(trap)])
+    tau = np.concatenate([np.zeros(1), np.cumsum(trap)])
     return tau
+
+
+def compute_tau_anchored_batch(alpha, integrand_factor, log_tau_ref):
+    """Vectorized tau computation for all wavelengths simultaneously.
+
+    alpha : (n_layers, n_wl)
+    integrand_factor : (n_layers,)
+    log_tau_ref : (n_layers,)
+    Returns tau : (n_layers, n_wl)
+    """
+    integrand = alpha * integrand_factor[:, np.newaxis]
+    dlog = np.diff(log_tau_ref)
+    trap = 0.5 * (integrand[1:] + integrand[:-1]) * dlog[:, np.newaxis]
+    return np.concatenate([np.zeros((1, alpha.shape[1])), np.cumsum(trap, axis=0)], axis=0)
 
 
 def compute_tau_bezier(s, alpha):
@@ -78,7 +91,7 @@ def compute_tau_bezier(s, alpha):
     C = np.clip(C, 0.5 * np.min(alpha), 2.0 * np.max(alpha))
     for i in range(1, len(alpha)):
         tau[i] = tau[i-1] + (s[i-1] - s[i]) / 3.0 * (alpha[i] + alpha[i-1] + C[i-1])
-    return jnp.asarray(tau)
+    return np.asarray(tau)
 
 
 # ── Intensity schemes ───────────────────────────────────────────────────────
@@ -87,13 +100,13 @@ def compute_I_linear_flux_only(tau, S):
     if len(tau) == 1:
         return 0.0
     I = 0.0
-    next_exp = jnp.exp(-tau[0])
+    next_exp = np.exp(-tau[0])
     for i in range(len(tau) - 1):
         d = tau[i+1] - tau[i]
         d = d + (d == 0)
         m = (S[i+1] - S[i]) / d
         cur_exp = next_exp
-        next_exp = jnp.exp(-tau[i+1])
+        next_exp = np.exp(-tau[i+1])
         I = I + (-next_exp * (S[i+1] + m) + cur_exp * (S[i] + m))
     return I
 
@@ -101,19 +114,19 @@ def compute_I_linear_flux_only(tau, S):
 def compute_I_linear(tau, S):
     I = np.zeros_like(S)
     if len(tau) <= 1:
-        return jnp.asarray(I)
+        return np.asarray(I)
     for k in range(len(tau) - 2, -1, -1):
         d = float(tau[k+1] - tau[k])
         m = float(S[k+1] - S[k]) / d
         I[k] = (I[k+1] - float(S[k]) - m * (d + 1)) * np.exp(-d) + m + float(S[k])
-    return jnp.asarray(I)
+    return np.asarray(I)
 
 
 def compute_I_bezier(tau, S):
     I = np.zeros_like(S)
     I[-1] = 0.0
     if len(tau) <= 1:
-        return jnp.asarray(I)
+        return np.asarray(I)
     C = fritsch_butland_C(tau, S)
     for k in range(len(tau) - 2, -1, -1):
         d = float(tau[k+1] - tau[k])
@@ -123,14 +136,14 @@ def compute_I_bezier(tau, S):
         gamma = (2 * d - 4 + (2 * d + 4) * ed) / d ** 2
         I[k] = I[k+1] * ed + alpha * float(S[k]) + beta * float(S[k+1]) + gamma * C[k]
     I[0] *= np.exp(-float(tau[0]))
-    return jnp.asarray(I)
+    return np.asarray(I)
 
 
 # ── Exponential integrals ───────────────────────────────────────────────────
 
 def expint_transfer_integral_core(tau, m, b):
     return (1.0 / 6.0 * (tau * exponential_integral_2(tau) * (3 * b + 2 * m * tau)
-                         - jnp.exp(-tau) * (3 * b + 2 * m * (tau + 1))))
+                         - np.exp(-tau) * (3 * b + 2 * m * (tau + 1))))
 
 
 def compute_F_flux_only_expint(tau, S):
@@ -143,31 +156,66 @@ def compute_F_flux_only_expint(tau, S):
     return I
 
 
+def compute_F_flux_only_expint_batch(tau, S):
+    """Vectorized flux computation for all wavelengths using exponential integrals.
+
+    tau : (n_layers, n_wl)
+    S : (n_layers, n_wl)
+    Returns F : (n_wl,)
+    """
+    dtau = tau[1:] - tau[:-1]
+    safe_dtau = np.where(dtau == 0, 1.0, dtau)
+    m = (S[1:] - S[:-1]) / safe_dtau
+    b = S[:-1] - m * tau[:-1]
+    upper = expint_transfer_integral_core(tau[1:], m, b)
+    lower = expint_transfer_integral_core(tau[:-1], m, b)
+    return np.sum(np.asarray(upper) - np.asarray(lower), axis=0)
+
+
+def compute_I_linear_flux_only_batch(tau, S):
+    """Vectorized linear flux-only computation for all wavelengths.
+
+    tau : (n_layers, n_wl)
+    S : (n_layers, n_wl)
+    Returns F : (n_wl,)
+    """
+    d = tau[1:] - tau[:-1]
+    d = np.where(d == 0, 1.0, d)
+    m = (S[1:] - S[:-1]) / d
+    exp_tau = np.exp(-tau)
+    return np.sum(-exp_tau[1:] * (S[1:] + m) + exp_tau[:-1] * (S[:-1] + m), axis=0)
+
+
 def exponential_integral_2(x):
-    x = jnp.asarray(x)
+    x = np.asarray(x)
     r = _expint_large(x)
-    r = jnp.where(x < 9.0, _expint_8(x), r)
-    r = jnp.where(x < 7.5, _expint_7(x), r)
-    r = jnp.where(x < 6.5, _expint_6(x), r)
-    r = jnp.where(x < 5.5, _expint_5(x), r)
-    r = jnp.where(x < 4.5, _expint_4(x), r)
-    r = jnp.where(x < 3.5, _expint_3(x), r)
-    r = jnp.where(x < 2.5, _expint_2(x), r)
-    r = jnp.where(x < 1.1, _expint_small(x), r)
-    r = jnp.where(x == 0, 1.0, r)
+    r = np.where(x < 9.0, _expint_8(x), r)
+    r = np.where(x < 7.5, _expint_7(x), r)
+    r = np.where(x < 6.5, _expint_6(x), r)
+    r = np.where(x < 5.5, _expint_5(x), r)
+    r = np.where(x < 4.5, _expint_4(x), r)
+    r = np.where(x < 3.5, _expint_3(x), r)
+    r = np.where(x < 2.5, _expint_2(x), r)
+    r = np.where(x < 1.1, _expint_small(x), r)
+    r = np.where(x == 0, 1.0, r)
     return r
 
 
 def _expint_small(x):
     gamma = 0.5772156649015329
-    return (1 + ((jnp.log(x) + gamma - 1)
+    # Use np.maximum to avoid log(0) warnings; np.where in caller masks x=0
+    safe_x = np.maximum(x, 1e-300)
+    return (1 + ((np.log(safe_x) + gamma - 1)
                  + (-0.5 + (0.08333333333333333 + (-0.013888888888888888
                  + 0.0020833333333333333 * x) * x) * x) * x) * x)
 
 
 def _expint_large(x):
-    invx = 1.0 / x
-    return jnp.exp(-x) * (1 + (-2 + (6 + (-24 + 120 * invx) * invx) * invx) * invx) * invx
+    # Use np.maximum to avoid 1/0 and overflow warnings; np.where in
+    # caller masks small x (this branch is only used for x >= 5.5)
+    safe_x = np.maximum(x, 1.0)
+    invx = 1.0 / safe_x
+    return np.exp(-x) * (1 + (-2 + (6 + (-24 + 120 * invx) * invx) * invx) * invx) * invx
 
 
 def _expint_2(x):
@@ -322,7 +370,7 @@ def radiative_transfer(atm: ModelAtmosphere, alpha, S, mu_points,
         photosphere_correction = R_surface ** 2 / atm.R ** 2
         F = F * photosphere_correction
 
-    return jnp.asarray(F), jnp.asarray(I), mu_surface_grid, mu_weights
+    return np.asarray(F), np.asarray(I), mu_surface_grid, mu_weights
 
 
 def _radiative_transfer_core(mu_ind, layer_inds, n_inward, path, dsdz, log_tau_ref,
@@ -336,6 +384,24 @@ def _radiative_transfer_core(mu_ind, layer_inds, n_inward, path, dsdz, log_tau_r
 
     integrand_factor = tau_ref[layer_inds] / alpha_ref[layer_inds] * dsdz
 
+    # Fast vectorized path: process all wavelengths at once
+    if tau_scheme == "anchored" and I_scheme in ("linear_flux_only_expint", "linear_flux_only"):
+        alpha_all = alpha[layer_inds, :]
+        S_all = S[layer_inds, :]
+        tau = compute_tau_anchored_batch(alpha_all, integrand_factor, log_tau_ref[layer_inds])
+
+        if I_scheme == "linear_flux_only_expint":
+            F_all = compute_F_flux_only_expint_batch(tau, S_all)
+        else:
+            F_all = compute_I_linear_flux_only_batch(tau, S_all)
+
+        I[mu_ind, :] += np.asarray(F_all)
+
+        if mu_ind < n_inward:
+            I[mu_ind + n_inward, :] = I[mu_ind, :] * np.exp(-np.asarray(tau[-1, :]))
+        return
+
+    # Fallback: per-wavelength loop for non-default schemes (bezier, linear intensity)
     for wl in range(alpha.shape[1]):
         alpha_slice = alpha[layer_inds, wl]
         if tau_scheme == "anchored":

@@ -96,13 +96,44 @@ class CubicSpline:
         t_np, u_np, h_np, z_np, self._extrapolate = cubic_spline_build(
             t, u, extrapolate=extrapolate
         )
+        # Keep NumPy arrays for fast scalar evaluation
+        self._t_np = t_np
+        self._u_np = u_np
+        self._z_np = z_np
+        # JAX arrays for JIT-compatible evaluation
         self.t = jnp.array(t_np)
         self.u = jnp.array(u_np)
         self.h = jnp.array(h_np)
         self.z = jnp.array(z_np)
 
     def __call__(self, x):
+        if isinstance(x, (int, float)):
+            return self._eval_scalar(x)
         return cubic_spline_eval(self.t, self.u, self.h, self.z, x)
+
+    def _eval_scalar(self, x):
+        """Fast scalar evaluation using pure Python/NumPy (no JAX dispatch)."""
+        t = self._t_np
+        u = self._u_np
+        z = self._z_np
+        n = len(t) - 1
+        if x <= t[0]:
+            return float(u[0])
+        if x >= t[-1]:
+            return float(u[-1])
+        i = int(np.searchsorted(t, x, side='right')) - 1
+        if i < 0:
+            i = 0
+        elif i > n - 1:
+            i = n - 1
+        h_ip1 = t[i + 1] - t[i]
+        dr = t[i + 1] - x
+        dl = x - t[i]
+        val = (z[i] * dr ** 3 / (6.0 * h_ip1)
+               + z[i + 1] * dl ** 3 / (6.0 * h_ip1)
+               + (u[i + 1] / h_ip1 - z[i + 1] * h_ip1 / 6.0) * dl
+               + (u[i] / h_ip1 - z[i] * h_ip1 / 6.0) * dr)
+        return float(val)
 
     def batch(self, xs):
         return batch_eval(self.t, self.u, self.h, self.z, xs)

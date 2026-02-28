@@ -20,10 +20,17 @@ from .line_absorption import line_absorption, line_absorption_layers, build_line
 from .hydrogen_lines import hydrogen_line_absorption, hydrogen_line_absorption_layers
 from .radiative_transfer import radiative_transfer
 from .utils import merge_bounds, blackbody
-from .statmech import chemical_equilibrium
+from .statmech import chemical_equilibrium, _ChemEqContext
 from .read_statmech import setup_all
 from .cubic_splines import CubicSpline as _CubicSpline, cubic_spline_build, cubic_spline_eval
 from .molecular_cross_sections import interpolate_molecular_cross_sections
+
+_FILTER_CACHE = {}
+_LINE_PREP_CACHE = {}
+_CACHE_MAXSIZE = 16
+_STATMECH_SETUP_CACHE = None
+_PF_CACHE = {}
+_LEC_CACHE = {}
 
 
 @dataclass
@@ -50,11 +57,118 @@ def _ensure_callable(data):
 
 
 def _build_partition_funcs(partition_funcs):
-    return {spec: _ensure_callable(data) for spec, data in partition_funcs.items()}
+    key = id(partition_funcs)
+    cached = _PF_CACHE.get(key)
+    if cached is not None:
+        return cached
+    out = {spec: _ensure_callable(data) for spec, data in partition_funcs.items()}
+    _cache_put(_PF_CACHE, key, out)
+    return out
 
 
 def _build_log_equilibrium_constants(log_equilibrium_constants):
-    return {spec: _ensure_callable(data) for spec, data in log_equilibrium_constants.items()}
+    key = id(log_equilibrium_constants)
+    cached = _LEC_CACHE.get(key)
+    if cached is not None:
+        return cached
+    out = {spec: _ensure_callable(data) for spec, data in log_equilibrium_constants.items()}
+    _cache_put(_LEC_CACHE, key, out)
+    return out
+
+
+def _get_statmech_setup_cached():
+    global _STATMECH_SETUP_CACHE
+    if _STATMECH_SETUP_CACHE is None:
+        ionization_energies, partition_funcs, log_equilibrium_constants = setup_all()
+        _STATMECH_SETUP_CACHE = (
+            ionization_energies,
+            _build_partition_funcs(partition_funcs),
+            _build_log_equilibrium_constants(log_equilibrium_constants),
+        )
+    return _STATMECH_SETUP_CACHE
+
+
+def _cache_put(cache, key, value):
+    if key in cache:
+        cache[key] = value
+        return
+    if len(cache) >= _CACHE_MAXSIZE:
+        oldest = next(iter(cache))
+        del cache[oldest]
+    cache[key] = value
+
+
+def _wavelength_cache_key(wls: Wavelengths):
+    windows = tuple((float(lo), float(hi)) for lo, hi in wls.eachwindow())
+    return (float(wls.all_wls[0]), float(wls.all_wls[-1]), int(len(wls.all_wls)), windows)
+
+
+def _get_filtered_linelist(linelist: Linelist, wls: Wavelengths, line_buffer):
+    key = (id(linelist), _wavelength_cache_key(wls), float(line_buffer))
+    cached = _FILTER_CACHE.get(key)
+    if cached is not None:
+        return cached
+    filtered = filter_linelist(linelist, wls, line_buffer)
+    _cache_put(_FILTER_CACHE, key, filtered)
+    return filtered
+
+
+def _prepare_linelist_fast(linelist: Linelist, chunk_size: int):
+    key = (id(linelist), int(chunk_size))
+    cached = _LINE_PREP_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    species = linelist.species
+    unique_species = list(dict.fromkeys(species))
+    species_to_idx = {s: i for i, s in enumerate(unique_species)}
+    line_species_idx = np.array([species_to_idx[s] for s in species], dtype=np.int32)
+
+    linelist_jax = {
+        "wl": jnp.asarray(linelist.wl),
+        "log_gf": jnp.asarray(linelist.log_gf),
+        "species_idx": jnp.zeros(linelist.n_lines, dtype=jnp.int32),
+        "E_lower": jnp.asarray(linelist.E_lower),
+        "gamma_rad": jnp.asarray(linelist.gamma_rad),
+        "gamma_stark": jnp.asarray(linelist.gamma_stark),
+        "vdW_1": jnp.asarray(linelist.vdW_1),
+        "vdW_2": jnp.asarray(linelist.vdW_2),
+        "mass": jnp.asarray([s.get_mass() for s in species]),
+        "is_molecule": jnp.asarray([s.ismolecule() for s in species]),
+    }
+    chunks = build_linelist_chunks(linelist_jax, chunk_size=chunk_size)
+    out = (linelist_jax, chunks, unique_species, line_species_idx)
+    _cache_put(_LINE_PREP_CACHE, key, out)
+    return out
+
+
+def _build_n_abs_matrix(n_dicts, unique_species, line_species_idx, partition_funcs, temps):
+    n_layers = len(n_dicts)
+    n_unique = len(unique_species)
+    if n_unique == 0:
+        return np.zeros((n_layers, 0), dtype=float)
+
+    dens = np.zeros((n_layers, n_unique), dtype=float)
+    for j, spec in enumerate(unique_species):
+        dens[:, j] = [nd.get(spec, 0.0) for nd in n_dicts]
+
+    lnT = np.log(np.asarray(temps))
+    part = np.empty((n_layers, n_unique), dtype=float)
+    for j, spec in enumerate(unique_species):
+        pf = partition_funcs[spec]
+        try:
+            vals = np.asarray(pf(lnT), dtype=float)
+            if vals.shape == ():
+                vals = np.full(n_layers, float(vals))
+            elif vals.shape[0] != n_layers:
+                vals = np.array([pf(float(lt)) for lt in lnT], dtype=float)
+        except Exception:
+            vals = np.array([pf(float(lt)) for lt in lnT], dtype=float)
+        part[:, j] = vals
+
+    n_unique_scaled = np.divide(dens, part, out=np.zeros_like(dens), where=part != 0.0)
+    return n_unique_scaled[:, line_species_idx]
+
 
 def filter_linelist(linelist: Linelist, wls: Wavelengths, line_buffer, warn_empty=True):
     nlines_before = linelist.n_lines
@@ -265,7 +379,7 @@ def synthesize(atm, linelist: Linelist, A_X, *wavelength_params,
         linelist5 = get_reference_wavelength_linelist(linelist, atm.reference_wavelength,
                                                       use_internal_reference_linelist)
 
-    linelist = filter_linelist(linelist, wls, line_buffer)
+    linelist = _get_filtered_linelist(linelist, wls, line_buffer)
 
     if len(A_X) < 92 or A_X[0] != 12:
         raise ValueError("A(H) must be a 92-element vector with A[1] == 12")
@@ -274,16 +388,31 @@ def synthesize(atm, linelist: Linelist, A_X, *wavelength_params,
     abs_abundances = abs_abundances / np.sum(abs_abundances)
 
     if ionization_energies is None or partition_funcs is None or log_equilibrium_constants is None:
-        ionization_energies, partition_funcs, log_equilibrium_constants = setup_all()
-    partition_funcs = _build_partition_funcs(partition_funcs)
-    log_equilibrium_constants = _build_log_equilibrium_constants(log_equilibrium_constants)
+        ionization_energies, partition_funcs, log_equilibrium_constants = _get_statmech_setup_cached()
+    else:
+        partition_funcs = _build_partition_funcs(partition_funcs)
+        log_equilibrium_constants = _build_log_equilibrium_constants(log_equilibrium_constants)
 
     n_layers = atm.n_layers
-    alpha = jnp.zeros((n_layers, len(wls)))
+    alpha_np = np.zeros((n_layers, len(wls)))
     alpha_ref = np.zeros(n_layers)
     n_e_vals = np.zeros(n_layers)
     n_dicts = []
     alpha_cntm_funcs = []
+
+    # Merge reference frequency into continuum grid to halve the number of calls
+    if tau_scheme == "anchored":
+        ref_freq = c_cgs / atm.reference_wavelength
+        combined_freqs = np.append(cntm_wls.all_freqs, ref_freq)
+    else:
+        combined_freqs = np.asarray(cntm_wls.all_freqs)
+
+    # Pre-compute chemical equilibrium context once (avoids rebuilding
+    # Species objects and molecule data for every layer)
+    cheq_ctx = None
+    if use_chemical_equilibrium_from is None:
+        cheq_ctx = _ChemEqContext(abs_abundances, ionization_energies,
+                                  partition_funcs, log_equilibrium_constants)
 
     for i in range(n_layers):
         if use_chemical_equilibrium_from is None:
@@ -291,8 +420,7 @@ def synthesize(atm, linelist: Linelist, A_X, *wavelength_params,
                 atm.temp[i], atm.number_density[i], atm.electron_number_density[i],
                 abs_abundances, ionization_energies, partition_funcs,
                 log_equilibrium_constants,
-                electron_number_density_warn_threshold=electron_number_density_warn_threshold,
-                electron_number_density_warn_min_value=electron_number_density_warn_min_value,
+                _ctx=cheq_ctx,
             )
         else:
             sol = use_chemical_equilibrium_from
@@ -302,67 +430,52 @@ def synthesize(atm, linelist: Linelist, A_X, *wavelength_params,
         n_e_vals[i] = ne
         n_dicts.append(n_dict)
 
-        alpha_cntm_vals = total_continuum_absorption(
-            cntm_wls.all_freqs, atm.temp[i], ne, n_dict, partition_funcs
+        alpha_combined = total_continuum_absorption(
+            combined_freqs, atm.temp[i], ne, n_dict, partition_funcs
         )
-        alpha_cntm_vals = np.asarray(alpha_cntm_vals)[::-1]
-        alpha_cntm = np.interp(wls.all_wls, cntm_wls.all_wls, alpha_cntm_vals, left=alpha_cntm_vals[0], right=alpha_cntm_vals[-1])
-        alpha = alpha.at[i, :].set(alpha_cntm)
 
         if tau_scheme == "anchored":
-            alpha_ref[i] = total_continuum_absorption(
-                np.array([c_cgs / atm.reference_wavelength]),
-                atm.temp[i], ne, n_dict, partition_funcs
-            )[0]
+            alpha_ref[i] = alpha_combined[-1]
+            alpha_cntm_vals = alpha_combined[:-1][::-1]
+        else:
+            alpha_cntm_vals = alpha_combined[::-1]
 
+        alpha_cntm = np.interp(wls.all_wls, cntm_wls.all_wls, alpha_cntm_vals, left=alpha_cntm_vals[0], right=alpha_cntm_vals[-1])
+        alpha_np[i, :] = alpha_cntm
         alpha_cntm_funcs.append(alpha_cntm)
 
+    # Keep alpha as numpy throughout; convert to/from JAX only for line absorption
+    alpha = alpha_np
+
     # Julia filters out H III from number_densities (synthesize.jl line 248-249)
+    H_I = Species(Formula.from_Z(1), 0)
+    He_I = Species(Formula.from_Z(2), 0)
     H_III = Species(Formula.from_Z(1), 2)
     number_densities = {spec: np.array([n[spec] for n in n_dicts])
                         for spec in n_dicts[0] if spec != H_III}
 
     linelist5_chunks = None
-    # Precompute species index mapping for fast n_abs construction
-    linelist_species = linelist.species
-    unique_species = list(dict.fromkeys(linelist_species))
-    species_to_idx = {s: i for i, s in enumerate(unique_species)}
-    line_species_idx = np.array([species_to_idx[s] for s in linelist_species], dtype=np.int32)
+    if chunk_size is None:
+        chunk_size = 1024 if prefer_jit else 500
+
+    linelist_jax, linelist_chunks, unique_species, line_species_idx = _prepare_linelist_fast(
+        linelist, chunk_size
+    )
 
     if tau_scheme == "anchored":
-        linelist5_jax = {
-            "wl": jnp.asarray(linelist5.wl),
-            "log_gf": jnp.asarray(linelist5.log_gf),
-            "species_idx": jnp.zeros(linelist5.n_lines, dtype=jnp.int32),
-            "E_lower": jnp.asarray(linelist5.E_lower),
-            "gamma_rad": jnp.asarray(linelist5.gamma_rad),
-            "gamma_stark": jnp.asarray(linelist5.gamma_stark),
-            "vdW_1": jnp.asarray(linelist5.vdW_1),
-            "vdW_2": jnp.asarray(linelist5.vdW_2),
-            "mass": jnp.asarray([s.get_mass() for s in linelist5.species]),
-            "is_molecule": jnp.asarray([s.ismolecule() for s in linelist5.species]),
-        }
-        if chunk_size is None:
-            chunk_size = 1024 if prefer_jit else 500
-        linelist5_chunks = build_linelist_chunks(linelist5_jax, chunk_size=chunk_size)
-        linelist5_species = linelist5.species
-        unique_species5 = list(dict.fromkeys(linelist5_species))
-        species5_to_idx = {s: i for i, s in enumerate(unique_species5)}
-        line5_species_idx = np.array([species5_to_idx[s] for s in linelist5_species], dtype=np.int32)
+        linelist5_jax, linelist5_chunks, unique_species5, line5_species_idx = _prepare_linelist_fast(
+            linelist5, chunk_size
+        )
         # vmic in cm/s for line absorption (Julia passes vmic * 1e5)
         xi_cms = vmic * 1e5
         # Vectorized line absorption for reference wavelength
-        n_abs_ref = np.zeros((n_layers, linelist5.n_lines), dtype=float)
+        n_abs_ref = _build_n_abs_matrix(
+            n_dicts, unique_species5, line5_species_idx, partition_funcs, atm.temp
+        )
         alpha_cntm_ref = np.zeros((n_layers, linelist5.n_lines), dtype=float)
-        nH_I_vals_ref = np.zeros(n_layers, dtype=float)
+        nH_I_vals_ref = number_densities.get(H_I, np.zeros(n_layers, dtype=float))
         for i in range(n_layers):
-            nH_I_vals_ref[i] = n_dicts[i].get(Species(Formula.from_Z(1), 0), 0.0)
             alpha_cntm_ref[i, :] = alpha_ref[i]
-            n_unique = np.array([
-                n_dicts[i].get(s, 0.0) / partition_funcs[s](math.log(atm.temp[i]))
-                for s in unique_species5
-            ])
-            n_abs_ref[i, :] = n_unique[line5_species_idx]
 
         alpha_ref_lines = line_absorption_layers(
             jnp.asarray([atm.reference_wavelength]),
@@ -387,50 +500,32 @@ def synthesize(atm, linelist: Linelist, A_X, *wavelength_params,
 
     cntm = None
     if return_cntm:
-        cntm, _, _, _ = radiative_transfer(atm, np.asarray(alpha), source_fn, mu_values,
+        cntm, _, _, _ = radiative_transfer(atm, alpha, source_fn, mu_values,
                                            alpha_ref=alpha_ref, tau_ref=atm.tau_ref,
                                            I_scheme=I_scheme, tau_scheme=tau_scheme)
 
     if hydrogen_lines:
-        nH_I_vals = np.array([n.get(Species(Formula.from_Z(1), 0), 0.0) for n in n_dicts])
-        nHe_I_vals = np.array([n.get(Species(Formula.from_Z(2), 0), 0.0) for n in n_dicts])
+        nH_I_vals = number_densities.get(H_I, np.zeros(n_layers, dtype=float))
+        nHe_I_vals = number_densities.get(He_I, np.zeros(n_layers, dtype=float))
         U_H_I_vals = np.array([partition_funcs[Species(Formula.from_Z(1), 0)](math.log(t)) for t in atm.temp])
         xi_vals = (vmic if np.isscalar(vmic) else np.asarray(vmic)) * 1e5
         h_alpha = hydrogen_line_absorption_layers(
             wls.all_wls, atm.temp, n_e_vals, nH_I_vals, nHe_I_vals, U_H_I_vals,
             xi_vals, hydrogen_line_window_size * 1e-8, use_MHD=use_MHD_for_hydrogen_lines
         )
-        alpha = alpha + h_alpha
+        alpha = alpha + np.asarray(h_alpha)
 
-    linelist_jax = {
-        "wl": jnp.asarray(linelist.wl),
-        "log_gf": jnp.asarray(linelist.log_gf),
-        "species_idx": jnp.zeros(linelist.n_lines, dtype=jnp.int32),
-        "E_lower": jnp.asarray(linelist.E_lower),
-        "gamma_rad": jnp.asarray(linelist.gamma_rad),
-        "gamma_stark": jnp.asarray(linelist.gamma_stark),
-        "vdW_1": jnp.asarray(linelist.vdW_1),
-        "vdW_2": jnp.asarray(linelist.vdW_2),
-        "mass": jnp.asarray([s.get_mass() for s in linelist.species]),
-        "is_molecule": jnp.asarray([s.ismolecule() for s in linelist.species]),
-    }
-    if chunk_size is None:
-        chunk_size = 1024 if prefer_jit else 500
-    linelist_chunks = build_linelist_chunks(linelist_jax, chunk_size=chunk_size)
     # vmic in cm/s for line absorption (Julia passes vmic * 1e5)
     xi_cms = vmic * 1e5
     # Vectorized line absorption across layers
-    n_abs_matrix = np.zeros((n_layers, linelist.n_lines), dtype=float)
-    alpha_cntm_at_lines = np.zeros((n_layers, linelist.n_lines), dtype=float)
-    nH_I_vals = np.zeros(n_layers, dtype=float)
-    for i in range(n_layers):
-        nH_I_vals[i] = n_dicts[i].get(Species(Formula.from_Z(1), 0), 0.0)
-        alpha_cntm_at_lines[i, :] = np.interp(linelist.wl, wls.all_wls, alpha_cntm_funcs[i])
-        n_unique = np.array([
-            n_dicts[i].get(s, 0.0) / partition_funcs[s](math.log(atm.temp[i]))
-            for s in unique_species
-        ])
-        n_abs_matrix[i, :] = n_unique[line_species_idx]
+    n_abs_matrix = _build_n_abs_matrix(
+        n_dicts, unique_species, line_species_idx, partition_funcs, atm.temp
+    )
+    alpha_cntm_at_lines = np.vstack([
+        np.interp(linelist.wl, wls.all_wls, alpha_cntm)
+        for alpha_cntm in alpha_cntm_funcs
+    ]) if linelist.n_lines > 0 else np.zeros((n_layers, 0), dtype=float)
+    nH_I_vals = number_densities.get(H_I, np.zeros(n_layers, dtype=float))
 
     alpha_lines = line_absorption_layers(
         jnp.asarray(wls.all_wls), linelist_jax,
@@ -440,14 +535,15 @@ def synthesize(atm, linelist: Linelist, A_X, *wavelength_params,
         cutoff_threshold=line_cutoff_threshold,
         chunks=linelist_chunks,
     )
-    alpha = alpha + alpha_lines
+    alpha = alpha + np.asarray(alpha_lines)
 
     if molecular_cross_sections:
-        alpha = interpolate_molecular_cross_sections(alpha, molecular_cross_sections, wls,
-                                                     atm.temp, vmic, number_densities)
+        alpha = np.asarray(interpolate_molecular_cross_sections(
+            jnp.asarray(alpha), molecular_cross_sections, wls,
+            atm.temp, vmic, number_densities))
 
     flux, intensity, mu_grid, mu_weights = radiative_transfer(
-        atm, np.asarray(alpha), source_fn, mu_values,
+        atm, alpha, source_fn, mu_values,
         alpha_ref=alpha_ref, tau_ref=atm.tau_ref,
         I_scheme=I_scheme, tau_scheme=tau_scheme
     )

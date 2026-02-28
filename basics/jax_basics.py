@@ -13,6 +13,8 @@ from korg_jax.linelist import read_linelist
 from korg_jax.atmosphere import read_model_atmosphere
 from korg_jax.abundances import format_A_X
 
+FAST_MODE = os.environ.get("KORGMAX_FAST", "1") != "0"
+
 
 def main():
     linelist_path = os.path.join(repo_root, "basics", "linelist.vald")
@@ -34,17 +36,38 @@ def main():
 
     A_X = format_A_X(0)
 
-    # Timing 4000-4030
-    t0 = time.process_time()
-    sol_4000 = KJ.synthesize.synthesize(atm, lines, A_X, 4000, 4030, prefer_jit=True)
-    t1 = time.process_time() - t0
-    print("synthesize 4000-4030 time:", t1)
+    if FAST_MODE:
+        print("FAST MODE enabled (set KORGMAX_FAST=0 for full run)")
+        wl_a = (4000, 4008)
+        wl_b = (5000, 5008)
+        wl_abund = (5015, 5018)
+        prefer_jit = False
+        hydrogen_lines = False
+    else:
+        wl_a = (4000, 4030)
+        wl_b = (5000, 5030)
+        wl_abund = (5015, 5025)
+        prefer_jit = True
+        hydrogen_lines = True
 
-    # Timing 5000-5030
-    t0 = time.process_time()
-    sol = KJ.synthesize.synthesize(atm, lines, A_X, 5000, 5030, prefer_jit=True)
-    t2 = time.process_time() - t0
-    print("synthesize 5000-5030 time:", t2)
+    # Timing window A
+    t0 = time.perf_counter()
+    sol_4000 = KJ.synthesize.synthesize(
+        atm, lines, A_X, wl_a[0], wl_a[1],
+        prefer_jit=prefer_jit, hydrogen_lines=hydrogen_lines
+    )
+    t1 = time.perf_counter() - t0
+    print(f"synthesize {wl_a[0]}-{wl_a[1]} time:", t1)
+
+    # Timing window B
+    t0 = time.perf_counter()
+    sol = KJ.synthesize.synthesize(
+        atm, lines, A_X, wl_b[0], wl_b[1],
+        prefer_jit=prefer_jit, hydrogen_lines=hydrogen_lines,
+        use_chemical_equilibrium_from=sol_4000,
+    )
+    t2 = time.perf_counter() - t0
+    print(f"synthesize {wl_b[0]}-{wl_b[1]} time:", t2)
 
     # Print key outputs for comparison
     flux = np.array(sol.flux)
@@ -62,9 +85,18 @@ def main():
     alpha_rich_A_X = format_A_X(0, 0.5)
     Ni_enriched_A_X = format_A_X({"Ni": 1.0})
 
-    metal_poor_sol = KJ.synthesize.synthesize(atm, lines, metal_poor_A_X, 5015, 5025, prefer_jit=True)
-    alpha_rich_sol = KJ.synthesize.synthesize(atm, lines, alpha_rich_A_X, 5015, 5025, prefer_jit=True)
-    Ni_enriched_sol = KJ.synthesize.synthesize(atm, lines, Ni_enriched_A_X, 5015, 5025, prefer_jit=True)
+    metal_poor_sol = KJ.synthesize.synthesize(
+        atm, lines, metal_poor_A_X, wl_abund[0], wl_abund[1],
+        prefer_jit=prefer_jit, hydrogen_lines=hydrogen_lines
+    )
+    alpha_rich_sol = KJ.synthesize.synthesize(
+        atm, lines, alpha_rich_A_X, wl_abund[0], wl_abund[1],
+        prefer_jit=prefer_jit, hydrogen_lines=hydrogen_lines
+    )
+    Ni_enriched_sol = KJ.synthesize.synthesize(
+        atm, lines, Ni_enriched_A_X, wl_abund[0], wl_abund[1],
+        prefer_jit=prefer_jit, hydrogen_lines=hydrogen_lines
+    )
 
     # Print summary stats for comparisons
     for name, soln in [

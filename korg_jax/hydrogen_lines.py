@@ -87,8 +87,11 @@ def _load_stark_profiles(fname):
             delta = g["delta_nu_over_F0"][()]
             prof = g["profile"][()]
 
-            logP = np.log(prof)
-            logP[~np.isfinite(logP)] = -700.0
+            # Some tabulated Stark profile bins are exactly zero; map them to a
+            # finite floor directly instead of triggering log(0) warnings.
+            logP = np.full_like(prof, -700.0, dtype=float)
+            positive = prof > 0.0
+            logP[positive] = np.log(prof[positive])
 
             log_delta = np.empty_like(delta)
             log_delta[0] = -np.finfo(float).max
@@ -132,13 +135,12 @@ def _pack_stark_profiles(stark_profiles):
     if stark_profiles is None:
         return None
     n_lines = len(stark_profiles)
-    temps = np.array(stark_profiles[0]["temps"], dtype=float)
-    nes = np.array(stark_profiles[0]["nes"], dtype=float)
-    log_delta = np.array(stark_profiles[0]["log_delta"], dtype=float)
-
-    nT = len(temps)
-    nNe = len(nes)
-    nD = len(log_delta)
+    nT = min(len(np.asarray(line["temps"])) for line in stark_profiles)
+    nNe = min(len(np.asarray(line["nes"])) for line in stark_profiles)
+    nD = min(np.asarray(line["logP"]).shape[2] for line in stark_profiles)
+    temps = np.array(stark_profiles[0]["temps"][:nT], dtype=float)
+    nes = np.array(stark_profiles[0]["nes"][:nNe], dtype=float)
+    log_delta = np.array(stark_profiles[0]["log_delta"][:nD], dtype=float)
 
     logP = np.zeros((n_lines, nT, nNe, nD), dtype=float)
     lambda0 = np.zeros((n_lines, nT, nNe), dtype=float)
@@ -147,8 +149,10 @@ def _pack_stark_profiles(stark_profiles):
     log_gf = np.zeros(n_lines, dtype=float)
 
     for i, line in enumerate(stark_profiles):
-        logP[i] = line["logP"]
-        lambda0[i] = line["lambda0"]
+        # Some line tables have smaller grids; align on the common sub-grid.
+        line_logP = np.asarray(line["logP"], dtype=float)
+        logP[i] = line_logP[:nT, :nNe, :nD]
+        lambda0[i] = np.asarray(line["lambda0"], dtype=float)[:nT, :nNe]
         lower[i] = line["lower"]
         upper[i] = line["upper"]
         log_gf[i] = line["log_gf"]

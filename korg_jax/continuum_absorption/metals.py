@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import os
 import numpy as np
-import jax.numpy as jnp
 
 from ..species import Species, Formula
 from ..constants import hplanck_eV, Rydberg_eV
@@ -225,31 +224,31 @@ def _peach1970_departure(T, sigma, T_vals, sigma_vals, table_vals):
     -------
     D : JAX array, same shape as sigma
     """
-    T_arr = jnp.asarray(T_vals)
-    s_arr = jnp.asarray(sigma_vals)
-    tab = jnp.asarray(table_vals)
+    T_arr = np.asarray(T_vals)
+    s_arr = np.asarray(sigma_vals)
+    tab = np.asarray(table_vals)
 
-    sigma = jnp.asarray(sigma)
+    sigma = np.asarray(sigma)
 
     # Determine whether T and sigma are inside the table domain
     T_in = (T >= T_arr[0]) & (T <= T_arr[-1])
     sigma_in = (sigma >= s_arr[0]) & (sigma <= s_arr[-1])
 
     # Clamp for interpolation (result will be zeroed outside domain)
-    T_c = jnp.clip(T, T_arr[0], T_arr[-1])
-    sigma_c = jnp.clip(sigma, s_arr[0], s_arr[-1])
+    T_c = np.clip(T, T_arr[0], T_arr[-1])
+    sigma_c = np.clip(sigma, s_arr[0], s_arr[-1])
 
     # T index
-    iT = jnp.clip(jnp.searchsorted(T_arr, T_c, side='right') - 1, 0, len(T_arr) - 2)
+    iT = np.clip(np.searchsorted(T_arr, T_c, side='right') - 1, 0, len(T_arr) - 2)
     T0 = T_arr[iT]
     T1 = T_arr[iT + 1]
-    tT = jnp.where(T1 == T0, 0.0, (T_c - T0) / (T1 - T0))
+    tT = np.where(T1 == T0, 0.0, (T_c - T0) / (T1 - T0))
 
     # sigma index (vectorized)
-    iS = jnp.clip(jnp.searchsorted(s_arr, sigma_c, side='right') - 1, 0, len(s_arr) - 2)
+    iS = np.clip(np.searchsorted(s_arr, sigma_c, side='right') - 1, 0, len(s_arr) - 2)
     s0 = s_arr[iS]
     s1 = s_arr[iS + 1]
-    tS = jnp.where(s1 == s0, 0.0, (sigma_c - s0) / (s1 - s0))
+    tS = np.where(s1 == s0, 0.0, (sigma_c - s0) / (s1 - s0))
 
     # Bilinear interpolation
     f00 = tab[iT, iS]
@@ -260,7 +259,7 @@ def _peach1970_departure(T, sigma, T_vals, sigma_vals, table_vals):
     D = (1 - tT) * (1 - tS) * f00 + tT * (1 - tS) * f10 + (1 - tT) * tS * f01 + tT * tS * f11
 
     # Zero outside domain (extrapolation_bc=0)
-    D = jnp.where(T_in & sigma_in, D, 0.0)
+    D = np.where(T_in & sigma_in, D, 0.0)
     return D
 
 
@@ -287,8 +286,8 @@ def positive_ion_ff_absorption(nus, T, number_densities, ne):
     number_densities : dict mapping Species -> number density
     ne : electron number density
     """
-    nus = jnp.asarray(nus)
-    alpha = jnp.zeros_like(nus)
+    nus = np.asarray(nus)
+    alpha = np.zeros_like(nus)
 
     # Accumulate number densities of species WITHOUT departure coefficients,
     # grouped by net charge Z.  This avoids calling hydrogenic_ff_absorption
@@ -341,11 +340,11 @@ def metal_bf_absorption(nus, T, number_densities):
     shape (n_nu, n_logT).  We interpolate bilinearly in (nu, logT) space.
     """
     if _metal_bf_data is None:
-        return jnp.zeros_like(jnp.asarray(nus))
+        return np.zeros_like(np.asarray(nus))
 
-    nus = jnp.asarray(nus)
-    logT = jnp.log10(T)
-    alpha = jnp.zeros_like(nus)
+    nus = np.asarray(nus)
+    logT = np.log10(T)
+    alpha = np.zeros_like(nus)
 
     H_I = Species(Formula.from_Z(1), 0)
     He_I = Species(Formula.from_Z(2), 0)
@@ -362,10 +361,10 @@ def metal_bf_absorption(nus, T, number_densities):
         nu_grid, logT_grid, log_sigma = data
         log_sigma_vals = _bilinear_interp_jax(nus, logT, nu_grid, logT_grid, log_sigma)
         # Mask -inf values that arise from log(0) in the cross-section tables
-        mask = jnp.isfinite(log_sigma_vals)
-        alpha = alpha + jnp.where(
+        mask = np.isfinite(log_sigma_vals)
+        alpha = alpha + np.where(
             mask,
-            jnp.exp(jnp.log(n_spec) + log_sigma_vals) * 1e-18,
+            np.exp(np.log(n_spec) + log_sigma_vals) * 1e-18,
             0.0,
         )
 
@@ -411,7 +410,7 @@ def _load_metal_bf_tables():
             # (len(logT_grid), len(nu_grid)), it was stored transposed.
             if sigma.shape == (len(logT_grid), len(nu_grid)):
                 sigma = sigma.T
-            data[spec] = (jnp.asarray(nu_grid), jnp.asarray(logT_grid), jnp.asarray(sigma))
+            data[spec] = (np.asarray(nu_grid), np.asarray(logT_grid), np.asarray(sigma))
 
     return data
 
@@ -427,26 +426,26 @@ def _bilinear_interp_jax(x, y, x_grid, y_grid, table):
     y_grid : 1-D array of grid knots for axis 1
     table : 2-D array, shape (len(x_grid), len(y_grid))
     """
-    xg = jnp.asarray(x_grid)
-    yg = jnp.asarray(y_grid)
-    tab = jnp.asarray(table)
+    xg = np.asarray(x_grid)
+    yg = np.asarray(y_grid)
+    tab = np.asarray(table)
 
-    x = jnp.asarray(x)
-    y = jnp.asarray(y)
+    x = np.asarray(x)
+    y = np.asarray(y)
 
-    x = jnp.clip(x, xg[0], xg[-1])
-    y = jnp.clip(y, yg[0], yg[-1])
+    x = np.clip(x, xg[0], xg[-1])
+    y = np.clip(y, yg[0], yg[-1])
 
-    ix = jnp.clip(jnp.searchsorted(xg, x, side="right") - 1, 0, len(xg) - 2)
-    iy = jnp.clip(jnp.searchsorted(yg, y, side="right") - 1, 0, len(yg) - 2)
+    ix = np.clip(np.searchsorted(xg, x, side="right") - 1, 0, len(xg) - 2)
+    iy = np.clip(np.searchsorted(yg, y, side="right") - 1, 0, len(yg) - 2)
 
     x0 = xg[ix]
     x1 = xg[ix + 1]
     y0 = yg[iy]
     y1 = yg[iy + 1]
 
-    tx = jnp.where(x1 == x0, 0.0, (x - x0) / (x1 - x0))
-    ty = jnp.where(y1 == y0, 0.0, (y - y0) / (y1 - y0))
+    tx = np.where(x1 == x0, 0.0, (x - x0) / (x1 - x0))
+    ty = np.where(y1 == y0, 0.0, (y - y0) / (y1 - y0))
 
     f00 = tab[ix, iy]
     f10 = tab[ix + 1, iy]

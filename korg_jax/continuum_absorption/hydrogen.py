@@ -8,15 +8,13 @@ import os
 import math
 import warnings
 import numpy as np
-import jax
-import jax.numpy as jnp
 
 from ..constants import (
     c_cgs, hplanck_cgs, hplanck_eV, kboltz_cgs, kboltz_eV,
     electron_mass_cgs, electron_charge_cgs, RydbergH_eV, Rydberg_eV,
     bohr_radius_cgs, eV_to_cgs,
 )
-from ..statmech import hummer_mihalas_w
+from ..statmech import hummer_mihalas_w, hummer_mihalas_w_vec
 
 # ── Data directory ────────────────────────────────────────────────────────────
 _data_dir = os.path.join(os.path.dirname(__file__), "..", "..", "data")
@@ -80,7 +78,7 @@ def simple_hydrogen_bf_cross_section(n, nu):
     # 64*pi^4*e^10*m_e / (c * h^6 * 3*sqrt(3))
     bf_sigma_const = 2.815e29
     sigma = bf_sigma_const * (inv_n2 * inv_n2 * inv_n) * (1.0 / nu) ** 3 * 1e18  # Mb
-    return jnp.where(hplanck_eV * nu >= threshold, sigma, 0.0)
+    return np.where(hplanck_eV * nu >= threshold, sigma, 0.0)
 
 
 def H_I_bf(nus, T, nH_I, nHe_I, ne, invU_H, n_max_MHD=6,
@@ -102,11 +100,11 @@ def H_I_bf(nus, T, nH_I, nHe_I, ne, invU_H, n_max_MHD=6,
     n_max_MHD : int, max level for detailed cross-sections (default 6)
     use_MHD_for_Lyman : bool, apply MHD to n=1 (default False)
     """
-    nus = jnp.asarray(nus, dtype=jnp.float64)
+    nus = np.asarray(nus, dtype=np.float64)
     chi = RydbergH_eV  # 13.598... eV
     kT = kboltz_eV * T
 
-    total_cross_section = jnp.zeros_like(nus)
+    total_cross_section = np.zeros_like(nus)
 
     # --- Levels n=1..n_max_MHD with detailed cross-sections ---
     if _H_I_bf_cross_sections is not None:
@@ -120,19 +118,19 @@ def H_I_bf(nus, T, nH_I, nHe_I, ne, invU_H, n_max_MHD=6,
             # --- Cross-section ---
             # For nu >= nu_break: interpolate from tabulated data
             # For nu < nu_break: extrapolate as sigma ~ nu^{-3}
-            E_tab = jnp.asarray(Es_np, dtype=jnp.float64)
-            sig_tab = jnp.asarray(sigs_np, dtype=jnp.float64)
+            E_tab = np.asarray(Es_np, dtype=np.float64)
+            sig_tab = np.asarray(sigs_np, dtype=np.float64)
 
             photon_E = hplanck_eV * nus  # eV
             # Linear interpolation with no extrapolation (clamp to range)
-            sigma_interp = jnp.interp(photon_E, E_tab, sig_tab,
+            sigma_interp = np.interp(photon_E, E_tab, sig_tab,
                                       left=sig_tab[0], right=sig_tab[-1])
 
             # Cross-section at nu_break for extrapolation below threshold
             sigma_at_break = float(np.interp(nu_break * hplanck_eV, Es_np, sigs_np))
             scaling_factor = sigma_at_break / nu_break**(-3)
 
-            cross_section = jnp.where(
+            cross_section = np.where(
                 nus > nu_break,
                 sigma_interp,
                 nus**(-3) * scaling_factor,
@@ -142,31 +140,26 @@ def H_I_bf(nus, T, nH_I, nHe_I, ne, invU_H, n_max_MHD=6,
             # For nu >= nu_break: dissolved_fraction = 1.0
             # For nu < nu_break: depends on MHD of upper level
             if not use_MHD_for_Lyman and n == 1:
-                dissolved_fraction = jnp.where(nus > nu_break, 1.0, 0.0)
+                dissolved_fraction = np.where(nus > nu_break, 1.0, 0.0)
             else:
                 # For frequencies below the ionization threshold, compute
                 # the effective quantum number and MHD probability
-                n_eff_arr = 1.0 / jnp.sqrt(jnp.maximum(
+                n_eff_arr = 1.0 / np.sqrt(np.maximum(
                     1.0 / n**2 - hplanck_eV * nus / chi, 1e-30))
 
-                # Compute w_upper for each frequency (Python loop over array)
-                # We vectorize this using numpy since hummer_mihalas_w uses math
+                # Vectorized MHD occupation probability for all frequencies
                 n_eff_np = np.array(n_eff_arr)
-                w_upper_np = np.zeros(len(n_eff_np))
-                for i_freq in range(len(n_eff_np)):
-                    n_e = float(n_eff_np[i_freq])
-                    if n_e > 0 and np.isfinite(n_e):
-                        w_upper_np[i_freq] = hummer_mihalas_w(T, n_e, nH_I, nHe_I, ne)
-                    else:
-                        w_upper_np[i_freq] = 0.0
-                w_upper = jnp.asarray(w_upper_np)
+                valid = (n_eff_np > 0) & np.isfinite(n_eff_np)
+                safe_n_eff = np.where(valid, n_eff_np, 1.0)
+                w_upper_np = np.where(valid, hummer_mihalas_w_vec(T, safe_n_eff, nH_I, nHe_I, ne), 0.0)
+                w_upper = np.asarray(w_upper_np)
 
-                frac = jnp.where(
+                frac = np.where(
                     w_lower > 0,
                     1.0 - w_upper / w_lower,
                     0.0,
                 )
-                dissolved_fraction = jnp.where(nus > nu_break, 1.0, frac)
+                dissolved_fraction = np.where(nus > nu_break, 1.0, frac)
 
             total_cross_section = total_cross_section + (
                 occupation_prob * cross_section * dissolved_fraction
@@ -194,7 +187,7 @@ def H_I_bf(nus, T, nH_I, nHe_I, ne, invU_H, n_max_MHD=6,
 
     # Factor 1e-18 converts cross-sections from megabarns to cm^2
     return (nH_I * invU_H * total_cross_section
-            * (1.0 - jnp.exp(-hplanck_eV * nus / kT)) * 1e-18)
+            * (1.0 - np.exp(-hplanck_eV * nus / kT)) * 1e-18)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -206,7 +199,7 @@ def _ndens_Hminus(nH_I_div_partition, ne, T, ion_energy=_Hminus_ion_energy):
     nHI_groundstate = 2.0 * nH_I_div_partition
     coef = 3.31283018e-22  # (h^2/(2*pi*m))^1.5, cm^3 * eV^1.5
     beta = 1.0 / (kboltz_eV * T)
-    return 0.25 * nHI_groundstate * ne * coef * beta**1.5 * jnp.exp(ion_energy * beta)
+    return 0.25 * nHI_groundstate * ne * coef * beta**1.5 * np.exp(ion_energy * beta)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -238,32 +231,32 @@ def _Hminus_bf_cross_section(nu):
 
     if _Hminus_bf_nu is not None and _Hminus_bf_sigma is not None:
         # McLaughlin 2017 from HDF5
-        nu_tab = jnp.asarray(_Hminus_bf_nu)
-        sig_tab = jnp.asarray(_Hminus_bf_sigma)
+        nu_tab = np.asarray(_Hminus_bf_nu)
+        sig_tab = np.asarray(_Hminus_bf_sigma)
         min_interp_nu = float(_Hminus_bf_nu.min())
 
         # Low-energy power law: sigma = coef * (nu - ion_nu)^1.5
         sig_at_min = float(np.interp(min_interp_nu, _Hminus_bf_nu, _Hminus_bf_sigma))
         low_nu_coef = sig_at_min / (min_interp_nu - ion_nu)**1.5
 
-        sigma_interp = jnp.interp(nu, nu_tab, sig_tab,
+        sigma_interp = np.interp(nu, nu_tab, sig_tab,
                                   left=sig_tab[0], right=sig_tab[-1])
-        sigma_low = low_nu_coef * jnp.maximum(nu - ion_nu, 0.0)**1.5
+        sigma_low = low_nu_coef * np.maximum(nu - ion_nu, 0.0)**1.5
 
         # Choose: below table range use power law, in range use table, above ion use 0
-        sigma = jnp.where(
+        sigma = np.where(
             nu <= ion_nu,
             0.0,
-            jnp.where(nu < min_interp_nu, sigma_low, sigma_interp),
+            np.where(nu < min_interp_nu, sigma_low, sigma_interp),
         )
     else:
         # Wishart 1979 fallback: convert nu to wavelength in Angstroms
-        lam_A = c_cgs * 1e8 / jnp.maximum(nu, 1.0)
-        sigma = jnp.interp(lam_A,
-                           jnp.asarray(_Hminus_bf_lambda_wishart),
-                           jnp.asarray(_Hminus_bf_sigma_wishart),
+        lam_A = c_cgs * 1e8 / np.maximum(nu, 1.0)
+        sigma = np.interp(lam_A,
+                           np.asarray(_Hminus_bf_lambda_wishart),
+                           np.asarray(_Hminus_bf_sigma_wishart),
                            left=0.0, right=0.0)
-        sigma = jnp.where(nu <= ion_nu, 0.0, sigma)
+        sigma = np.where(nu <= ion_nu, 0.0, sigma)
 
     return sigma
 
@@ -274,9 +267,9 @@ def Hminus_bf(nus, T, nH_I_div_U, ne):
     Uses McLaughlin 2017 cross-sections (from HDF5) if available,
     otherwise falls back to Wishart 1979.
     """
-    nus = jnp.asarray(nus)
+    nus = np.asarray(nus)
     sigma = _Hminus_bf_cross_section(nus)  # cm^2
-    stim = 1.0 - jnp.exp(-hplanck_cgs * nus / (kboltz_cgs * T))
+    stim = 1.0 - np.exp(-hplanck_cgs * nus / (kboltz_cgs * T))
     n_Hminus = _ndens_Hminus(nH_I_div_U, ne, T, _Hminus_ion_energy)
     return n_Hminus * sigma * stim
 
@@ -328,13 +321,13 @@ def Hminus_ff(nus, T, nH_I_div_U, ne):
 
     Valid range: 1823-151890 Angstroms, T = 1400-10080 K (theta 0.5-3.6).
     """
-    nus = jnp.asarray(nus)
+    nus = np.asarray(nus)
     lam_A = c_cgs * 1e8 / nus  # Angstroms
     theta = 5040.0 / T
 
     # Bilinear interpolation into Bell & Berrington table
     K = 1e-26 * _bilinear_interp_jax(
-        lam_A, jnp.full_like(nus, theta),
+        lam_A, np.full_like(nus, theta),
         _Hminus_ff_lambda, _Hminus_ff_theta, _Hminus_ff_K,
     )
 
@@ -463,7 +456,7 @@ def H2plus_bf_ff(nus, T, nH_I, nH_II):
 
     Uses tabulated cross-sections with linear extrapolation outside grid.
     """
-    nus = jnp.asarray(nus)
+    nus = np.asarray(nus)
     lambdas_A = c_cgs * 1e8 / nus
 
     # Interpolate equilibrium constant (linear extrapolation)
@@ -479,7 +472,7 @@ def H2plus_bf_ff(nus, T, nH_I, nH_II):
 
     # Stimulated emission correction
     beta = 1.0 / (kboltz_eV * T)
-    stim = 1.0 - jnp.exp(-hplanck_eV * nus * beta)
+    stim = 1.0 - np.exp(-hplanck_eV * nus * beta)
 
     return (sigma_bf / K + sigma_ff) * nH_I * nH_II * stim
 
@@ -493,9 +486,9 @@ def _linear_interp_extrap(x, xp, fp):
 
     Parameters: x is scalar or array, xp/fp are numpy arrays (grid/values).
     """
-    xp = jnp.asarray(xp)
-    fp = jnp.asarray(fp)
-    x = jnp.asarray(x)
+    xp = np.asarray(xp)
+    fp = np.asarray(fp)
+    x = np.asarray(x)
 
     # Linear extrapolation below
     slope_lo = (fp[1] - fp[0]) / (xp[1] - xp[0])
@@ -506,10 +499,10 @@ def _linear_interp_extrap(x, xp, fp):
     extrap_hi = fp[-1] + slope_hi * (x - xp[-1])
 
     # Interior interpolation
-    interp_val = jnp.interp(x, xp, fp)
+    interp_val = np.interp(x, xp, fp)
 
-    return jnp.where(x < xp[0], extrap_lo,
-                     jnp.where(x > xp[-1], extrap_hi, interp_val))
+    return np.where(x < xp[0], extrap_lo,
+                     np.where(x > xp[-1], extrap_hi, interp_val))
 
 
 def _bilinear_interp_jax(x, y, x_grid, y_grid, table):
@@ -518,24 +511,24 @@ def _bilinear_interp_jax(x, y, x_grid, y_grid, table):
     Used for H- ff where Julia uses Throw() extrapolation (caller must
     ensure inputs are in range).
     """
-    xg = jnp.asarray(x_grid)
-    yg = jnp.asarray(y_grid)
-    tab = jnp.asarray(table)
+    xg = np.asarray(x_grid)
+    yg = np.asarray(y_grid)
+    tab = np.asarray(table)
 
-    x = jnp.asarray(x)
-    y = jnp.asarray(y)
+    x = np.asarray(x)
+    y = np.asarray(y)
 
-    x = jnp.clip(x, xg[0], xg[-1])
-    y = jnp.clip(y, yg[0], yg[-1])
+    x = np.clip(x, xg[0], xg[-1])
+    y = np.clip(y, yg[0], yg[-1])
 
-    ix = jnp.clip(jnp.searchsorted(xg, x, side="right") - 1, 0, len(xg) - 2)
-    iy = jnp.clip(jnp.searchsorted(yg, y, side="right") - 1, 0, len(yg) - 2)
+    ix = np.clip(np.searchsorted(xg, x, side="right") - 1, 0, len(xg) - 2)
+    iy = np.clip(np.searchsorted(yg, y, side="right") - 1, 0, len(yg) - 2)
 
     x0 = xg[ix]; x1 = xg[ix + 1]
     y0 = yg[iy]; y1 = yg[iy + 1]
 
-    tx = jnp.where(x1 == x0, 0.0, (x - x0) / (x1 - x0))
-    ty = jnp.where(y1 == y0, 0.0, (y - y0) / (y1 - y0))
+    tx = np.where(x1 == x0, 0.0, (x - x0) / (x1 - x0))
+    ty = np.where(y1 == y0, 0.0, (y - y0) / (y1 - y0))
 
     f00 = tab[ix, iy]
     f10 = tab[ix + 1, iy]
@@ -551,14 +544,14 @@ def _bilinear_interp_extrap(x, y_scalar, x_grid, y_grid, table):
     y_scalar is a scalar (temperature), x is a 1D array (wavelengths).
     table shape is (n_x, n_y).
     """
-    xg = jnp.asarray(x_grid)
-    yg = jnp.asarray(y_grid)
-    tab = jnp.asarray(table)
-    x = jnp.asarray(x)
-    y = jnp.asarray(y_scalar)
+    xg = np.asarray(x_grid)
+    yg = np.asarray(y_grid)
+    tab = np.asarray(table)
+    x = np.asarray(x)
+    y = np.asarray(y_scalar)
 
     # y (temperature) index and weight -- with linear extrapolation
-    iy = jnp.clip(jnp.searchsorted(yg, y, side="right") - 1, 0, len(yg) - 2)
+    iy = np.clip(np.searchsorted(yg, y, side="right") - 1, 0, len(yg) - 2)
     y0 = yg[iy]; y1 = yg[iy + 1]
     ty = (y - y0) / (y1 - y0)  # can be <0 or >1 for extrapolation
 
