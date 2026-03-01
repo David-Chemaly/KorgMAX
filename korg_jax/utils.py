@@ -71,35 +71,45 @@ def apply_LSF(flux, wls, R, window_size=4):
         return np.array(flux, copy=True)
 
     wls = Wavelengths.from_array(wls) if not isinstance(wls, Wavelengths) else wls
-    flux = np.asarray(flux)
-    conv = np.zeros_like(flux)
-
-    for i, lam0 in enumerate(wls.all_wls):
-        lb, ub, kernel = _lsf_bounds_and_kernel(wls, lam0, R, window_size)
-        conv[i] = np.sum(flux[lb:ub] * kernel)
-
-    return conv
+    mat = compute_LSF_matrix(wls, wls.all_wls, R, window_size, verbose=False)
+    return mat @ np.asarray(flux)
 
 
 def compute_LSF_matrix(synth_wls, obs_wls, R, window_size=4, verbose=True):
     """Return a dense matrix applying the LSF and resampling.
 
-    This is a dense fallback for the sparse Julia implementation.
+    For a fixed (scalar) R the matrix is built with pure NumPy broadcasting
+    in O(n_obs * n_synth) without any Python loop.  For a callable R the
+    per-row loop is retained.
     """
-    if np.asarray(obs_wls)[0] >= 1:
-        obs_wls = np.asarray(obs_wls) * 1e-8
+    obs_wls = np.asarray(obs_wls)
+    if obs_wls[0] >= 1:
+        obs_wls = obs_wls * 1e-8
 
     synth_wls = Wavelengths.from_array(synth_wls) if not isinstance(synth_wls, Wavelengths) else synth_wls
+    synth_arr = synth_wls.all_wls  # (n_synth,)
 
-    if verbose:
-        if not ((synth_wls.all_wls[0] - 0.01) <= obs_wls[0] <= obs_wls[-1] <= (synth_wls.all_wls[-1] + 0.01)):
-            pass
+    if callable(R):
+        # Callable R: fall back to per-row loop (R varies per wavelength)
+        mat = np.zeros((len(obs_wls), len(synth_arr)))
+        for i, lam0 in enumerate(obs_wls):
+            lb, ub, kernel = _lsf_bounds_and_kernel(synth_wls, lam0, R, window_size)
+            mat[i, lb:ub] += kernel
+        return mat
 
-    mat = np.zeros((len(obs_wls), len(synth_wls.all_wls)))
-    for i, lam0 in enumerate(obs_wls):
-        lb, ub, kernel = _lsf_bounds_and_kernel(synth_wls, lam0, R, window_size)
-        mat[i, lb:ub] += kernel
-    return mat
+    # Fixed R: fully vectorised NumPy broadcast (no Python loop)
+    FWHM_factor = 2.0 * math.sqrt(2.0 * math.log(2.0))
+    sigma = obs_wls / R / FWHM_factor            # (n_obs,)
+    half_win = window_size * sigma               # (n_obs,)
+
+    # delta[i, j] = synth_arr[j] - obs_wls[i]
+    delta = synth_arr[np.newaxis, :] - obs_wls[:, np.newaxis]   # (n_obs, n_synth)
+
+    mask = np.abs(delta) <= half_win[:, np.newaxis]
+    phi = np.where(mask, np.exp(-0.5 * (delta / sigma[:, np.newaxis]) ** 2), 0.0)
+    row_sums = phi.sum(axis=1, keepdims=True)
+    phi = np.where(row_sums > 0, phi / row_sums, 0.0)
+    return phi
 
 
 # ── Rotation ────────────────────────────────────────────────────────────────

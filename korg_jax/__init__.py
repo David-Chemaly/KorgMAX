@@ -1,8 +1,9 @@
 """korg_jax — JAX port of Korg.jl for stellar spectral synthesis."""
 
-# Enable float64 support in JAX — required for stellar spectroscopy precision.
-import jax
-jax.config.update("jax_enable_x64", True)
+# Enable float64 by default; set KORGMAX_FLOAT32=1 to use float32 (faster on GPU, less precise).
+import os, jax
+if os.environ.get("KORGMAX_FLOAT32", "0") == "0":
+    jax.config.update("jax_enable_x64", True)
 
 from . import constants
 from . import atomic_data

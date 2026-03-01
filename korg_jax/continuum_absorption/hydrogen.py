@@ -8,13 +8,14 @@ import os
 import math
 import warnings
 import numpy as np
+import jax.numpy as jnp
 
 from ..constants import (
     c_cgs, hplanck_cgs, hplanck_eV, kboltz_cgs, kboltz_eV,
     electron_mass_cgs, electron_charge_cgs, RydbergH_eV, Rydberg_eV,
     bohr_radius_cgs, eV_to_cgs,
 )
-from ..statmech import hummer_mihalas_w, hummer_mihalas_w_vec
+from ..statmech import hummer_mihalas_w, hummer_mihalas_w_vec, hummer_mihalas_w_layers
 
 # ── Data directory ────────────────────────────────────────────────────────────
 _data_dir = os.path.join(os.path.dirname(__file__), "..", "..", "data")
@@ -281,11 +282,13 @@ def Hminus_bf(nus, T, nH_I_div_U, ne):
 # Table from Bell & Berrington (1987) https://doi.org/10.1088/0022-3700/20/4/019
 # K(lambda, theta) in units of 1e-26 cm^4/dyn (factor built into table values)
 _Hminus_ff_theta = np.array([0.5, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 2.8, 3.6])
+_Hminus_ff_theta_jnp = jnp.asarray(_Hminus_ff_theta)
 _Hminus_ff_lambda = np.array([
     1823, 2278, 2604, 3038, 3645, 4557, 5063, 5696, 6510, 7595, 9113,
     10126, 11392, 13019, 15189, 18227, 22784, 30378, 45567, 91134,
     113918, 151890,
 ], dtype=float)
+_Hminus_ff_lambda_jnp = jnp.asarray(_Hminus_ff_lambda)
 _Hminus_ff_K = np.array([
     [0.0178, 0.0222, 0.0308, 0.0402, 0.0498, 0.0596, 0.0695, 0.0795, 0.0896, 0.131, 0.172],
     [0.0228, 0.0280, 0.0388, 0.0499, 0.0614, 0.0732, 0.0851, 0.0972, 0.110, 0.160, 0.211],
@@ -310,6 +313,7 @@ _Hminus_ff_K = np.array([
     [42.3, 50.6, 66.4, 80.8, 94.5, 107.0, 120.0, 131.0, 142.0, 183.0, 219.0],
     [75.1, 90.0, 118.0, 144.0, 168.0, 191.0, 212.0, 234.0, 253.0, 325.0, 388.0],
 ], dtype=float)
+_Hminus_ff_K_jnp = jnp.asarray(_Hminus_ff_K)
 
 
 def Hminus_ff(nus, T, nH_I_div_U, ne):
@@ -343,9 +347,11 @@ def Hminus_ff(nus, T, nH_I_div_U, ne):
 
 # Temperature grids
 _H2plus_Ts = np.array([3150, 4200, 5040, 6300, 8400, 12600, 16800, 25200], dtype=float)
+_H2plus_Ts_jnp = jnp.asarray(_H2plus_Ts)
 _H2plus_K_vals = 1e19 * np.array([
     0.9600, 9.7683, 29.997, 89.599, 265.32, 845.01, 1685.3, 4289.5,
 ], dtype=float)
+_H2plus_K_vals_jnp = jnp.asarray(_H2plus_K_vals)
 
 # Wavelength grids (Angstroms, converted from nm)
 _H2plus_ff_lambda = 10.0 * np.array([
@@ -353,15 +359,17 @@ _H2plus_ff_lambda = 10.0 * np.array([
     230, 240, 250, 260, 270, 280, 290, 295, 300, 350, 400, 450, 500, 600, 700,
     800, 900, 1000, 2000, 3000, 4000, 5000, 11000, 15000, 20000,
 ], dtype=float)
+_H2plus_ff_lambda_jnp = jnp.asarray(_H2plus_ff_lambda)
 
 _H2plus_bf_lambda = 10.0 * np.array([
     50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160, 170, 180, 190, 200,
     210, 220, 230, 240, 250, 260, 270, 280, 290, 300, 350, 400, 450, 500, 600,
     700, 800, 900, 1000, 2000, 3000, 4500, 5000, 10000, 15000, 20000,
 ], dtype=float)
+_H2plus_bf_lambda_jnp = jnp.asarray(_H2plus_bf_lambda)
 
 # Cross-section tables (converted to cgs: bf * 1e-18, ff * 1e-39)
-_H2plus_bf_sigma = 1e-18 * np.array([
+_H2plus_bf_sigma = 1e-18 * np.array([  # NumPy; _jnp versions below
     [7.34e-5, 1.43e-4, 2.04e-4, 2.87e-4, 3.89e-4, 4.97e-4, 5.49e-4, 5.98e-4],
     [0.0100, 0.0150, 0.0186, 0.0230, 0.0276, 0.0319, 0.0337, 0.0353],
     [0.1676, 0.1965, 0.2105, 0.2215, 0.2266, 0.2246, 0.2211, 0.2163],
@@ -406,6 +414,8 @@ _H2plus_bf_sigma = 1e-18 * np.array([
     [1.90e-3, 0.0123, 0.0286, 0.0607, 0.1161, 0.1982, 0.2487, 0.3042],
 ], dtype=float)
 
+_H2plus_bf_sigma_jnp = jnp.asarray(_H2plus_bf_sigma)
+
 _H2plus_ff_sigma = 1e-39 * np.array([
     [0.0174, 0.0154, 0.0142, 0.0130, 0.0116, 0.0100, 9.10e-3, 8.08e-3],
     [0.0280, 0.0246, 0.0227, 0.0207, 0.0184, 0.0158, 0.0143, 0.0126],
@@ -449,6 +459,7 @@ _H2plus_ff_sigma = 1e-39 * np.array([
     [3.8110, 3.7000, 3.6420, 3.5820, 3.5200, 3.4560, 3.4220, 3.3870],
     [4.3230, 4.2180, 4.1640, 4.1080, 4.0500, 3.9900, 3.9580, 3.9260],
 ], dtype=float)
+_H2plus_ff_sigma_jnp = jnp.asarray(_H2plus_ff_sigma)
 
 
 def H2plus_bf_ff(nus, T, nH_I, nH_II):
@@ -560,3 +571,201 @@ def _bilinear_interp_extrap(x, y_scalar, x_grid, y_grid, table):
 
     # Now interpolate in x with linear extrapolation
     return _linear_interp_extrap(x, xg, vals_at_y)
+
+
+def _bilinear_interp_jax_2d(x, y, x_grid, y_grid, table):
+    """Bilinear interpolation: x=(n_freq,), y=(n_layers,) → (n_layers, n_freq).
+
+    No extrapolation: clamps to grid edges.  Uses JAX for GPU dispatch.
+    """
+    xg = jnp.asarray(x_grid); yg = jnp.asarray(y_grid); tab = jnp.asarray(table)
+    x = jnp.clip(jnp.asarray(x), xg[0], xg[-1])   # (n_freq,)
+    y = jnp.clip(jnp.asarray(y), yg[0], yg[-1])   # (n_layers,)
+
+    ix = jnp.clip(jnp.searchsorted(xg, x, side="right") - 1, 0, len(xg) - 2)  # (n_freq,)
+    iy = jnp.clip(jnp.searchsorted(yg, y, side="right") - 1, 0, len(yg) - 2)  # (n_layers,)
+
+    tx = jnp.where(xg[ix + 1] == xg[ix], 0.0, (x - xg[ix]) / (xg[ix + 1] - xg[ix]))  # (n_freq,)
+    ty = jnp.where(yg[iy + 1] == yg[iy], 0.0, (y - yg[iy]) / (yg[iy + 1] - yg[iy]))  # (n_layers,)
+
+    ix_ = ix[None, :]; iy_ = iy[:, None]   # (1,n_freq), (n_layers,1)
+    tx_ = tx[None, :]; ty_ = ty[:, None]
+
+    f00 = tab[ix_,     iy_    ]  # (n_layers, n_freq)
+    f10 = tab[ix_ + 1, iy_    ]
+    f01 = tab[ix_,     iy_ + 1]
+    f11 = tab[ix_ + 1, iy_ + 1]
+
+    return (1 - tx_) * (1 - ty_) * f00 + tx_ * (1 - ty_) * f10 \
+         + (1 - tx_) * ty_ * f01 + tx_ * ty_ * f11
+
+
+def _bilinear_interp_extrap_layers(x, y_arr, x_grid, y_grid, table):
+    """Bilinear interp with linear extrap: x=(n_freq,), y_arr=(n_layers,) → (n_layers, n_freq).
+
+    Uses JAX for GPU dispatch.
+    """
+    xg = jnp.asarray(x_grid); yg = jnp.asarray(y_grid); tab = jnp.asarray(table)
+    x = jnp.asarray(x)       # (n_freq,)
+    y = jnp.asarray(y_arr)   # (n_layers,)
+
+    # y index with linear extrapolation allowed
+    iy = jnp.clip(jnp.searchsorted(yg, y, side="right") - 1, 0, len(yg) - 2)  # (n_layers,)
+    y0 = yg[iy]; y1 = yg[iy + 1]
+    ty = (y - y0) / (y1 - y0)   # (n_layers,), may be outside [0,1] for extrap
+
+    # tab[:, iy] → (n_xgrid, n_layers) via fancy indexing; then transpose to (n_layers, n_xgrid)
+    vals_at_y = ((1 - ty)[None, :] * tab[:, iy]
+               +      ty [None, :] * tab[:, iy + 1]).T   # (n_layers, n_xgrid)
+
+    # x interpolation with linear extrapolation, vectorised over layers
+    slope_lo = (vals_at_y[:, 1] - vals_at_y[:, 0]) / (xg[1] - xg[0])   # (n_layers,)
+    slope_hi = (vals_at_y[:, -1] - vals_at_y[:, -2]) / (xg[-1] - xg[-2])
+
+    extrap_lo = vals_at_y[:, 0:1] + slope_lo[:, None] * (x - xg[0])    # (n_layers, n_freq)
+    extrap_hi = vals_at_y[:, -1:] + slope_hi[:, None] * (x - xg[-1])
+
+    # Interior interpolation: find ix for each x (shared across layers)
+    ix  = jnp.clip(jnp.searchsorted(xg, x, side="right") - 1, 0, len(xg) - 2)  # (n_freq,)
+    ix1 = jnp.minimum(ix + 1, len(xg) - 1)
+    x0 = xg[ix]; x1 = xg[ix1]
+    tx = jnp.where(x1 == x0, 0.0, jnp.clip((x - x0) / (x1 - x0), 0.0, 1.0))   # (n_freq,)
+
+    interp_val = (vals_at_y[:, ix] * (1 - tx[None, :])
+                + vals_at_y[:, ix1] * tx[None, :])     # (n_layers, n_freq)
+
+    return jnp.where(x < xg[0], extrap_lo, jnp.where(x > xg[-1], extrap_hi, interp_val))
+
+
+# ── Layers (batch) versions of the main functions ───────────────────────────
+
+def H_I_bf_layers(nus, T, nH_I, nHe_I, ne, invU_H, n_max_MHD=6,
+                  use_MHD_for_Lyman=False):
+    """Batch H I bound-free: T/nH_I/nHe_I/ne/invU_H are (n_layers,).
+
+    Returns (n_layers, n_freq).
+    """
+    nus    = jnp.asarray(nus,    dtype=jnp.float64)  # (n_freq,)
+    T      = jnp.asarray(T,      dtype=jnp.float64)  # (n_layers,)
+    nH_I   = jnp.asarray(nH_I,   dtype=jnp.float64)
+    nHe_I  = jnp.asarray(nHe_I,  dtype=jnp.float64)
+    ne     = jnp.asarray(ne,     dtype=jnp.float64)
+    invU_H = jnp.asarray(invU_H, dtype=jnp.float64)
+
+    chi = RydbergH_eV
+    kT  = kboltz_eV * T                          # (n_layers,)
+    n_freq   = len(nus)
+    n_layers = len(T)
+
+    total_cross_section = jnp.zeros((n_layers, n_freq))
+
+    if _H_I_bf_cross_sections is not None:
+        for (n, Es_np, sigs_np) in _H_I_bf_cross_sections[:n_max_MHD]:
+            w_lower = hummer_mihalas_w(T, n, nH_I, nHe_I, ne)           # (n_layers,)
+            occupation_prob = w_lower * jnp.exp(-chi * (1 - 1.0 / n ** 2) / kT)
+
+            nu_break  = chi / (n ** 2 * hplanck_eV)
+            E_tab     = jnp.asarray(Es_np,   dtype=jnp.float64)
+            sig_tab   = jnp.asarray(sigs_np, dtype=jnp.float64)
+
+            photon_E     = hplanck_eV * nus                              # (n_freq,)
+            sigma_interp = jnp.interp(photon_E, E_tab, sig_tab,
+                                      left=sig_tab[0], right=sig_tab[-1])
+            sigma_at_break  = float(np.interp(nu_break * hplanck_eV, Es_np, sigs_np))
+            scaling_factor  = sigma_at_break / nu_break ** (-3)
+            cross_section = jnp.where(nus > nu_break,
+                                      sigma_interp, nus ** (-3) * scaling_factor)
+
+            if not use_MHD_for_Lyman and n == 1:
+                dissolved_fraction = jnp.where(nus > nu_break, 1.0, 0.0)
+                total_cross_section = total_cross_section + (
+                    occupation_prob[:, None] * cross_section[None, :] * dissolved_fraction[None, :])
+            else:
+                n_eff_arr  = 1.0 / jnp.sqrt(jnp.maximum(
+                    1.0 / n ** 2 - hplanck_eV * nus / chi, 1e-30))      # (n_freq,)
+                valid      = (n_eff_arr > 0) & jnp.isfinite(n_eff_arr)
+                safe_n_eff = jnp.where(valid, n_eff_arr, 1.0)
+
+                w_upper = jnp.where(
+                    valid[None, :],
+                    hummer_mihalas_w_layers(T, safe_n_eff, nH_I, nHe_I, ne),
+                    0.0,
+                )
+                frac = jnp.where(w_lower[:, None] > 0,
+                                 1.0 - w_upper / w_lower[:, None], 0.0)
+                dissolved_fraction = jnp.where(nus[None, :] > nu_break, 1.0, frac)
+                total_cross_section = total_cross_section + (
+                    occupation_prob[:, None] * cross_section[None, :] * dissolved_fraction)
+    else:
+        for n in range(1, n_max_MHD + 1):
+            w_lower = hummer_mihalas_w(T, n, nH_I, nHe_I, ne)
+            occupation_prob = (2.0 * n ** 2 * w_lower
+                               * jnp.exp(-chi * (1 - 1.0 / n ** 2) / kT))
+            cross_section = simple_hydrogen_bf_cross_section(n, nus)
+            total_cross_section = total_cross_section + (
+                occupation_prob[:, None] * cross_section[None, :])
+
+    for n in range(n_max_MHD + 1, 41):
+        w_lower = hummer_mihalas_w(T, n, nH_I, nHe_I, ne)   # (n_layers,) JAX or np
+        if np.all(np.asarray(w_lower) < 1e-5):
+            break
+        occupation_prob = (2.0 * n ** 2 * w_lower
+                           * jnp.exp(-chi * (1 - 1.0 / n ** 2) / kT))
+        cross_section = simple_hydrogen_bf_cross_section(n, nus)
+        total_cross_section = total_cross_section + (
+            occupation_prob[:, None] * cross_section[None, :])
+
+    stim = 1.0 - jnp.exp(-hplanck_eV * nus[None, :] / kT[:, None])
+    return (nH_I[:, None] * invU_H[:, None] * total_cross_section * stim * 1e-18)
+
+
+def Hminus_bf_layers(nus, T, nH_I_div_U, ne):
+    """Batch H- bound-free: T/nH_I_div_U/ne are (n_layers,). Returns (n_layers, n_freq)."""
+    nus        = jnp.asarray(nus)
+    T          = jnp.asarray(T, dtype=jnp.float64)[:, None]     # (n_layers, 1)
+    nH_I_div_U = jnp.asarray(nH_I_div_U)[:, None]
+    ne_arr     = jnp.asarray(ne)[:, None]
+
+    sigma    = jnp.asarray(_Hminus_bf_cross_section(nus))        # (n_freq,)
+    stim     = 1.0 - jnp.exp(-hplanck_cgs * nus / (kboltz_cgs * T))  # (n_layers, n_freq)
+    n_Hminus = _ndens_Hminus(nH_I_div_U, ne_arr, T, _Hminus_ion_energy)       # (n_layers, 1)
+    return n_Hminus * sigma * stim                               # (n_layers, n_freq)
+
+
+def Hminus_ff_layers(nus, T, nH_I_div_U, ne):
+    """Batch H- free-free: T/nH_I_div_U/ne are (n_layers,). Returns (n_layers, n_freq)."""
+    nus   = jnp.asarray(nus)
+    T     = jnp.asarray(T, dtype=jnp.float64)  # (n_layers,)
+    lam_A = c_cgs * 1e8 / nus                   # (n_freq,)
+    theta = 5040.0 / T                           # (n_layers,)
+
+    # 2D bilinear interp: lam_A=(n_freq,), theta=(n_layers,) → (n_layers, n_freq)
+    K = 1e-26 * _bilinear_interp_jax_2d(
+        lam_A, theta,
+        _Hminus_ff_lambda_jnp, _Hminus_ff_theta_jnp, _Hminus_ff_K_jnp,
+    )
+
+    Pe     = jnp.asarray(ne) * kboltz_cgs * T   # (n_layers,)
+    nHI_gs = 2.0 * jnp.asarray(nH_I_div_U)      # (n_layers,)
+    return K * Pe[:, None] * nHI_gs[:, None]
+
+
+def H2plus_bf_ff_layers(nus, T, nH_I, nH_II):
+    """Batch H2+ bf+ff: T/nH_I/nH_II are (n_layers,). Returns (n_layers, n_freq)."""
+    nus       = jnp.asarray(nus)
+    T         = jnp.asarray(T, dtype=jnp.float64)  # (n_layers,)
+    lambdas_A = c_cgs * 1e8 / nus                   # (n_freq,)
+
+    K        = _linear_interp_extrap(T, _H2plus_Ts_jnp, _H2plus_K_vals_jnp)    # (n_layers,)
+    sigma_bf = _bilinear_interp_extrap_layers(lambdas_A, T,
+                                              _H2plus_bf_lambda_jnp, _H2plus_Ts_jnp,
+                                              _H2plus_bf_sigma_jnp)
+    sigma_ff = _bilinear_interp_extrap_layers(lambdas_A, T,
+                                              _H2plus_ff_lambda_jnp, _H2plus_Ts_jnp,
+                                              _H2plus_ff_sigma_jnp)
+
+    beta  = 1.0 / (kboltz_eV * T)                                    # (n_layers,)
+    stim  = 1.0 - jnp.exp(-hplanck_eV * nus[None, :] * beta[:, None])  # (n_layers, n_freq)
+    nH_I  = jnp.asarray(nH_I)[:, None]
+    nH_II = jnp.asarray(nH_II)[:, None]
+    return (sigma_bf / K[:, None] + sigma_ff) * nH_I * nH_II * stim

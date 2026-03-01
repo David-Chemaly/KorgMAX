@@ -7,10 +7,11 @@ from __future__ import annotations
 
 import os
 import numpy as np
+import jax.numpy as jnp
 
 from ..species import Species, Formula
 from ..constants import hplanck_eV, Rydberg_eV
-from .hydrogenic import hydrogenic_ff_absorption
+from .hydrogenic import hydrogenic_ff_absorption, hydrogenic_ff_absorption_layers
 
 
 # ==============================================================================
@@ -459,3 +460,146 @@ try:
     _metal_bf_data = _load_metal_bf_tables()
 except Exception:
     _metal_bf_data = None
+
+# JAX versions of the metal bf tables (transferred to device once at import)
+if _metal_bf_data is not None:
+    _metal_bf_data_jnp = {
+        spec: (jnp.asarray(nu_g), jnp.asarray(logT_g), jnp.asarray(log_s))
+        for spec, (nu_g, logT_g, log_s) in _metal_bf_data.items()
+    }
+else:
+    _metal_bf_data_jnp = None
+
+
+# ==============================================================================
+# Batch (layers) versions
+# ==============================================================================
+
+def _bilinear_interp_layers(x, y, x_grid, y_grid, table):
+    """Bilinear interp (flat extrap): x=(n_freq,), y=(n_layers,) → (n_layers, n_freq). JAX."""
+    xg = jnp.asarray(x_grid); yg = jnp.asarray(y_grid); tab = jnp.asarray(table)
+    x = jnp.clip(jnp.asarray(x), xg[0], xg[-1])   # (n_freq,)
+    y = jnp.clip(jnp.asarray(y), yg[0], yg[-1])   # (n_layers,)
+
+    ix = jnp.clip(jnp.searchsorted(xg, x, side="right") - 1, 0, len(xg) - 2)  # (n_freq,)
+    iy = jnp.clip(jnp.searchsorted(yg, y, side="right") - 1, 0, len(yg) - 2)  # (n_layers,)
+
+    tx = jnp.where(xg[ix + 1] == xg[ix], 0.0, (x - xg[ix]) / (xg[ix + 1] - xg[ix]))
+    ty = jnp.where(yg[iy + 1] == yg[iy], 0.0, (y - yg[iy]) / (yg[iy + 1] - yg[iy]))
+
+    ix_ = ix[None, :]; iy_ = iy[:, None]
+    tx_ = tx[None, :]; ty_ = ty[:, None]
+
+    f00 = tab[ix_,     iy_    ]; f10 = tab[ix_ + 1, iy_    ]
+    f01 = tab[ix_,     iy_ + 1]; f11 = tab[ix_ + 1, iy_ + 1]
+    return (1 - tx_) * (1 - ty_) * f00 + tx_ * (1 - ty_) * f10 \
+         + (1 - tx_) * ty_ * f01 + tx_ * ty_ * f11
+
+
+def _peach1970_departure_layers(T, sigma, T_vals, sigma_vals, table_vals):
+    """Peach 1970 departure coefficient: T=(n_layers,), sigma=(n_freq,) → (n_layers, n_freq). JAX."""
+    T_arr = jnp.asarray(T_vals); s_arr = jnp.asarray(sigma_vals); tab = jnp.asarray(table_vals)
+    T     = jnp.asarray(T);     sigma = jnp.asarray(sigma)
+
+    T_in     = (T     >= T_arr[0]) & (T     <= T_arr[-1])   # (n_layers,)
+    sigma_in = (sigma >= s_arr[0]) & (sigma <= s_arr[-1])   # (n_freq,)
+
+    T_c     = jnp.clip(T,     T_arr[0], T_arr[-1])
+    sigma_c = jnp.clip(sigma, s_arr[0], s_arr[-1])
+
+    iT = jnp.clip(jnp.searchsorted(T_arr, T_c,     side="right") - 1, 0, len(T_arr) - 2)
+    iS = jnp.clip(jnp.searchsorted(s_arr, sigma_c, side="right") - 1, 0, len(s_arr) - 2)
+
+    tT = jnp.where(T_arr[iT + 1] == T_arr[iT], 0.0,
+                   (T_c - T_arr[iT]) / (T_arr[iT + 1] - T_arr[iT]))   # (n_layers,)
+    tS = jnp.where(s_arr[iS + 1] == s_arr[iS], 0.0,
+                   (sigma_c - s_arr[iS]) / (s_arr[iS + 1] - s_arr[iS]))   # (n_freq,)
+
+    iT_ = iT[:, None]; tT_ = tT[:, None]   # (n_layers, 1)
+    iS_ = iS[None, :]; tS_ = tS[None, :]   # (1, n_freq)
+
+    f00 = tab[iT_,     iS_    ]; f10 = tab[iT_ + 1, iS_    ]
+    f01 = tab[iT_,     iS_ + 1]; f11 = tab[iT_ + 1, iS_ + 1]
+
+    D = (1 - tT_) * (1 - tS_) * f00 + tT_ * (1 - tS_) * f10 \
+      + (1 - tT_) * tS_ * f01 + tT_ * tS_ * f11
+
+    return jnp.where(T_in[:, None] & sigma_in[None, :], D, 0.0)
+
+
+def positive_ion_ff_absorption_layers(nus, T, number_densities, ne):
+    """Batch positive-ion ff: T/ne are (n_layers,), densities are arrays. Returns (n_layers, n_freq)."""
+    nus = jnp.asarray(nus)
+    T   = jnp.asarray(T, dtype=jnp.float64)
+    ne  = jnp.asarray(ne, dtype=jnp.float64)
+    n_layers = len(T)
+
+    alpha    = jnp.zeros((n_layers, len(nus)))
+    ndens_Z1 = np.zeros(n_layers)   # numpy accumulators (small, not on GPU)
+    ndens_Z2 = np.zeros(n_layers)
+
+    for spec, ndens in number_densities.items():
+        if not isinstance(spec, Species):
+            continue
+        if spec.charge <= 0:
+            continue
+
+        ndens = np.asarray(ndens, dtype=np.float64)   # (n_layers,)
+
+        if spec in _peach1970_tables:
+            T_vals, sigma_vals, table_vals = _peach1970_tables[spec]
+            Z = spec.charge
+            sigma = nus / (Z * Z) * (hplanck_eV / Rydberg_eV)   # (n_freq,)
+            D = _peach1970_departure_layers(T, sigma, T_vals, sigma_vals, table_vals)
+            alpha = alpha + hydrogenic_ff_absorption_layers(nus, T, Z, ndens, ne) * (1.0 + D)
+        else:
+            if spec.charge == 1:
+                ndens_Z1 += ndens
+            elif spec.charge == 2:
+                ndens_Z2 += ndens
+
+    if np.any(ndens_Z1 > 0):
+        alpha = alpha + hydrogenic_ff_absorption_layers(nus, T, 1, ndens_Z1, ne)
+    if np.any(ndens_Z2 > 0):
+        alpha = alpha + hydrogenic_ff_absorption_layers(nus, T, 2, ndens_Z2, ne)
+
+    return alpha
+
+
+_H_I_metals  = Species(Formula.from_Z(1), 0)
+_He_I_metals = Species(Formula.from_Z(2), 0)
+_H_II_metals = Species(Formula.from_Z(1), 1)
+
+
+def metal_bf_absorption_layers(nus, T, number_densities):
+    """Batch metal bf: T is (n_layers,), densities are arrays. Returns (n_layers, n_freq)."""
+    if _metal_bf_data_jnp is None:
+        return jnp.zeros((len(T), len(nus)))
+
+    nus  = jnp.asarray(nus)
+    T    = jnp.asarray(T, dtype=jnp.float64)
+    logT = jnp.log10(T)   # (n_layers,)
+    alpha = jnp.zeros((len(T), len(nus)))
+
+    for spec, data in _metal_bf_data_jnp.items():
+        if spec in (_H_I_metals, _He_I_metals, _H_II_metals):
+            continue
+        n_spec = number_densities.get(spec, None)
+        if n_spec is None:
+            continue
+        n_spec = jnp.asarray(n_spec, dtype=jnp.float64)   # (n_layers,)
+        if jnp.all(n_spec == 0.0):
+            continue
+
+        nu_grid, logT_grid, log_sigma = data
+        log_sigma_vals = _bilinear_interp_layers(nus, logT, nu_grid, logT_grid, log_sigma)
+        mask = jnp.isfinite(log_sigma_vals)
+        safe_log_n = jnp.where(n_spec > 0, jnp.log(jnp.maximum(n_spec, 1e-300)),
+                                jnp.full_like(n_spec, -jnp.inf))
+        alpha = alpha + jnp.where(
+            mask & (n_spec[:, None] > 0),
+            jnp.exp(safe_log_n[:, None] + log_sigma_vals) * 1e-18,
+            0.0,
+        )
+
+    return alpha

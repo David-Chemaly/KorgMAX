@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import math
 import numpy as np
+import jax.numpy as jnp
 from numpy.polynomial.legendre import leggauss
 
 from .constants import c_cgs
@@ -75,12 +76,16 @@ def compute_tau_anchored_batch(alpha, integrand_factor, log_tau_ref):
     alpha : (n_layers, n_wl)
     integrand_factor : (n_layers,)
     log_tau_ref : (n_layers,)
-    Returns tau : (n_layers, n_wl)
+    Returns tau : (n_layers, n_wl)  — JAX array
     """
-    integrand = alpha * integrand_factor[:, np.newaxis]
-    dlog = np.diff(log_tau_ref)
-    trap = 0.5 * (integrand[1:] + integrand[:-1]) * dlog[:, np.newaxis]
-    return np.concatenate([np.zeros((1, alpha.shape[1])), np.cumsum(trap, axis=0)], axis=0)
+    alpha            = jnp.asarray(alpha)
+    integrand_factor = jnp.asarray(integrand_factor)
+    log_tau_ref      = jnp.asarray(log_tau_ref)
+
+    integrand = alpha * integrand_factor[:, None]
+    dlog = jnp.diff(log_tau_ref)
+    trap = 0.5 * (integrand[1:] + integrand[:-1]) * dlog[:, None]
+    return jnp.concatenate([jnp.zeros((1, alpha.shape[1])), jnp.cumsum(trap, axis=0)], axis=0)
 
 
 def compute_tau_bezier(s, alpha):
@@ -143,7 +148,7 @@ def compute_I_bezier(tau, S):
 
 def expint_transfer_integral_core(tau, m, b):
     return (1.0 / 6.0 * (tau * exponential_integral_2(tau) * (3 * b + 2 * m * tau)
-                         - np.exp(-tau) * (3 * b + 2 * m * (tau + 1))))
+                         - jnp.exp(-tau) * (3 * b + 2 * m * (tau + 1))))
 
 
 def compute_F_flux_only_expint(tau, S):
@@ -161,15 +166,16 @@ def compute_F_flux_only_expint_batch(tau, S):
 
     tau : (n_layers, n_wl)
     S : (n_layers, n_wl)
-    Returns F : (n_wl,)
+    Returns F : (n_wl,)  — JAX array
     """
+    tau = jnp.asarray(tau); S = jnp.asarray(S)
     dtau = tau[1:] - tau[:-1]
-    safe_dtau = np.where(dtau == 0, 1.0, dtau)
+    safe_dtau = jnp.where(dtau == 0, 1.0, dtau)
     m = (S[1:] - S[:-1]) / safe_dtau
     b = S[:-1] - m * tau[:-1]
     upper = expint_transfer_integral_core(tau[1:], m, b)
     lower = expint_transfer_integral_core(tau[:-1], m, b)
-    return np.sum(np.asarray(upper) - np.asarray(lower), axis=0)
+    return jnp.sum(upper - lower, axis=0)
 
 
 def compute_I_linear_flux_only_batch(tau, S):
@@ -177,45 +183,43 @@ def compute_I_linear_flux_only_batch(tau, S):
 
     tau : (n_layers, n_wl)
     S : (n_layers, n_wl)
-    Returns F : (n_wl,)
+    Returns F : (n_wl,)  — JAX array
     """
+    tau = jnp.asarray(tau); S = jnp.asarray(S)
     d = tau[1:] - tau[:-1]
-    d = np.where(d == 0, 1.0, d)
+    d = jnp.where(d == 0, 1.0, d)
     m = (S[1:] - S[:-1]) / d
-    exp_tau = np.exp(-tau)
-    return np.sum(-exp_tau[1:] * (S[1:] + m) + exp_tau[:-1] * (S[:-1] + m), axis=0)
+    exp_tau = jnp.exp(-tau)
+    return jnp.sum(-exp_tau[1:] * (S[1:] + m) + exp_tau[:-1] * (S[:-1] + m), axis=0)
 
 
 def exponential_integral_2(x):
-    x = np.asarray(x)
+    x = jnp.asarray(x)
     r = _expint_large(x)
-    r = np.where(x < 9.0, _expint_8(x), r)
-    r = np.where(x < 7.5, _expint_7(x), r)
-    r = np.where(x < 6.5, _expint_6(x), r)
-    r = np.where(x < 5.5, _expint_5(x), r)
-    r = np.where(x < 4.5, _expint_4(x), r)
-    r = np.where(x < 3.5, _expint_3(x), r)
-    r = np.where(x < 2.5, _expint_2(x), r)
-    r = np.where(x < 1.1, _expint_small(x), r)
-    r = np.where(x == 0, 1.0, r)
+    r = jnp.where(x < 9.0, _expint_8(x), r)
+    r = jnp.where(x < 7.5, _expint_7(x), r)
+    r = jnp.where(x < 6.5, _expint_6(x), r)
+    r = jnp.where(x < 5.5, _expint_5(x), r)
+    r = jnp.where(x < 4.5, _expint_4(x), r)
+    r = jnp.where(x < 3.5, _expint_3(x), r)
+    r = jnp.where(x < 2.5, _expint_2(x), r)
+    r = jnp.where(x < 1.1, _expint_small(x), r)
+    r = jnp.where(x == 0, 1.0, r)
     return r
 
 
 def _expint_small(x):
     gamma = 0.5772156649015329
-    # Use np.maximum to avoid log(0) warnings; np.where in caller masks x=0
-    safe_x = np.maximum(x, 1e-300)
-    return (1 + ((np.log(safe_x) + gamma - 1)
+    safe_x = jnp.maximum(x, 1e-300)
+    return (1 + ((jnp.log(safe_x) + gamma - 1)
                  + (-0.5 + (0.08333333333333333 + (-0.013888888888888888
                  + 0.0020833333333333333 * x) * x) * x) * x) * x)
 
 
 def _expint_large(x):
-    # Use np.maximum to avoid 1/0 and overflow warnings; np.where in
-    # caller masks small x (this branch is only used for x >= 5.5)
-    safe_x = np.maximum(x, 1.0)
+    safe_x = jnp.maximum(x, 1.0)
     invx = 1.0 / safe_x
-    return np.exp(-x) * (1 + (-2 + (6 + (-24 + 120 * invx) * invx) * invx) * invx) * invx
+    return jnp.exp(-x) * (1 + (-2 + (6 + (-24 + 120 * invx) * invx) * invx) * invx) * invx
 
 
 def _expint_2(x):
@@ -395,7 +399,7 @@ def _radiative_transfer_core(mu_ind, layer_inds, n_inward, path, dsdz, log_tau_r
         else:
             F_all = compute_I_linear_flux_only_batch(tau, S_all)
 
-        I[mu_ind, :] += np.asarray(F_all)
+        I[mu_ind, :] += np.asarray(F_all)   # pull JAX result back to CPU numpy array
 
         if mu_ind < n_inward:
             I[mu_ind + n_inward, :] = I[mu_ind, :] * np.exp(-np.asarray(tau[-1, :]))

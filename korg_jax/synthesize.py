@@ -15,7 +15,7 @@ from .wavelengths import Wavelengths
 from .species import Species, Formula
 from .abundances import format_A_X
 from .linelist import Linelist
-from .continuum_absorption import total_continuum_absorption
+from .continuum_absorption import total_continuum_absorption, total_continuum_absorption_layers
 from .line_absorption import line_absorption, line_absorption_layers, build_linelist_chunks
 from .hydrogen_lines import hydrogen_line_absorption, hydrogen_line_absorption_layers
 from .radiative_transfer import radiative_transfer
@@ -142,6 +142,38 @@ def _prepare_linelist_fast(linelist: Linelist, chunk_size: int):
     return out
 
 
+def _batch_interp(x, xp, fp2d):
+    """Vectorised linear interpolation over multiple rows (no Python loop).
+
+    Parameters
+    ----------
+    x   : (n_out,) query points, must lie within [xp[0], xp[-1]] or be clamped
+    xp  : (n_in,)  sorted grid points
+    fp2d: (n_rows, n_in) table values — one row per atmosphere layer
+
+    Returns
+    -------
+    (n_rows, n_out) interpolated values; values outside the grid are clamped
+    to fp2d[:, 0] or fp2d[:, -1].
+    """
+    x    = np.asarray(x)
+    xp   = np.asarray(xp)
+    fp2d = np.asarray(fp2d)
+
+    idx  = np.clip(np.searchsorted(xp, x, side="right") - 1, 0, len(xp) - 2)  # (n_out,)
+    x0   = xp[idx]; x1 = xp[idx + 1]
+    t    = np.where(x1 == x0, 0.0, (x - x0) / (x1 - x0))   # (n_out,)
+
+    # fp2d[:, idx] → (n_rows, n_out) via fancy indexing
+    f0 = fp2d[:, idx];  f1 = fp2d[:, idx + 1]
+    result = f0 + t[np.newaxis, :] * (f1 - f0)
+
+    # Clamp boundary (match np.interp behaviour)
+    result = np.where(x[np.newaxis, :] < xp[0],  fp2d[:, :1],  result)
+    result = np.where(x[np.newaxis, :] > xp[-1], fp2d[:, -1:], result)
+    return result
+
+
 def _build_n_abs_matrix(n_dicts, unique_species, line_species_idx, partition_funcs, temps):
     n_layers = len(n_dicts)
     n_unique = len(unique_species)
@@ -152,18 +184,14 @@ def _build_n_abs_matrix(n_dicts, unique_species, line_species_idx, partition_fun
     for j, spec in enumerate(unique_species):
         dens[:, j] = [nd.get(spec, 0.0) for nd in n_dicts]
 
-    lnT = np.log(np.asarray(temps))
+    lnT_jax = jnp.log(jnp.asarray(temps))
     part = np.empty((n_layers, n_unique), dtype=float)
     for j, spec in enumerate(unique_species):
         pf = partition_funcs[spec]
         try:
-            vals = np.asarray(pf(lnT), dtype=float)
-            if vals.shape == ():
-                vals = np.full(n_layers, float(vals))
-            elif vals.shape[0] != n_layers:
-                vals = np.array([pf(float(lt)) for lt in lnT], dtype=float)
-        except Exception:
-            vals = np.array([pf(float(lt)) for lt in lnT], dtype=float)
+            vals = np.asarray(pf.batch(lnT_jax), dtype=float)
+        except AttributeError:
+            vals = np.array([pf(float(lt)) for lt in np.asarray(lnT_jax)], dtype=float)
         part[:, j] = vals
 
     n_unique_scaled = np.divide(dens, part, out=np.zeros_like(dens), where=part != 0.0)
@@ -414,6 +442,7 @@ def synthesize(atm, linelist: Linelist, A_X, *wavelength_params,
         cheq_ctx = _ChemEqContext(abs_abundances, ionization_energies,
                                   partition_funcs, log_equilibrium_constants)
 
+    # Phase 1: Serial chemical equilibrium (Newton–Broyden per layer)
     for i in range(n_layers):
         if use_chemical_equilibrium_from is None:
             ne, n_dict = chemical_equilibrium(
@@ -430,29 +459,30 @@ def synthesize(atm, linelist: Linelist, A_X, *wavelength_params,
         n_e_vals[i] = ne
         n_dicts.append(n_dict)
 
-        alpha_combined = total_continuum_absorption(
-            combined_freqs, atm.temp[i], ne, n_dict, partition_funcs
-        )
-
-        if tau_scheme == "anchored":
-            alpha_ref[i] = alpha_combined[-1]
-            alpha_cntm_vals = alpha_combined[:-1][::-1]
-        else:
-            alpha_cntm_vals = alpha_combined[::-1]
-
-        alpha_cntm = np.interp(wls.all_wls, cntm_wls.all_wls, alpha_cntm_vals, left=alpha_cntm_vals[0], right=alpha_cntm_vals[-1])
-        alpha_np[i, :] = alpha_cntm
-        alpha_cntm_funcs.append(alpha_cntm)
-
-    # Keep alpha as numpy throughout; convert to/from JAX only for line absorption
-    alpha = alpha_np
-
     # Julia filters out H III from number_densities (synthesize.jl line 248-249)
     H_I = Species(Formula.from_Z(1), 0)
     He_I = Species(Formula.from_Z(2), 0)
     H_III = Species(Formula.from_Z(1), 2)
     number_densities = {spec: np.array([n[spec] for n in n_dicts])
                         for spec in n_dicts[0] if spec != H_III}
+
+    # Phase 2: Batch continuum absorption for all layers simultaneously
+    alpha_combined_all = total_continuum_absorption_layers(
+        combined_freqs, atm.temp, n_e_vals, number_densities, partition_funcs
+    )  # (n_layers, n_combined_freqs)
+
+    if tau_scheme == "anchored":
+        alpha_ref = alpha_combined_all[:, -1]                    # (n_layers,)
+        alpha_cntm_vals_all = alpha_combined_all[:, :-1][:, ::-1]  # (n_layers, n_cntm_wls)
+    else:
+        alpha_cntm_vals_all = alpha_combined_all[:, ::-1]        # (n_layers, n_cntm_wls)
+
+    # Vectorised interpolation from continuum grid → synthesis grid (all layers at once)
+    alpha_np = _batch_interp(wls.all_wls, cntm_wls.all_wls, alpha_cntm_vals_all)
+    alpha_cntm_funcs = list(alpha_np)   # list of (n_wl,) views, one per layer
+
+    # Keep alpha as numpy throughout; convert to/from JAX only for line absorption
+    alpha = alpha_np
 
     linelist5_chunks = None
     if chunk_size is None:
@@ -472,10 +502,10 @@ def synthesize(atm, linelist: Linelist, A_X, *wavelength_params,
         n_abs_ref = _build_n_abs_matrix(
             n_dicts, unique_species5, line5_species_idx, partition_funcs, atm.temp
         )
-        alpha_cntm_ref = np.zeros((n_layers, linelist5.n_lines), dtype=float)
         nH_I_vals_ref = number_densities.get(H_I, np.zeros(n_layers, dtype=float))
-        for i in range(n_layers):
-            alpha_cntm_ref[i, :] = alpha_ref[i]
+        alpha_cntm_ref = np.broadcast_to(
+            alpha_ref[:, np.newaxis], (n_layers, linelist5.n_lines)
+        ).copy()
 
         alpha_ref_lines = line_absorption_layers(
             jnp.asarray([atm.reference_wavelength]),
@@ -496,7 +526,9 @@ def synthesize(atm, linelist: Linelist, A_X, *wavelength_params,
             )
             alpha_ref = np.asarray(alpha_ref_arr).reshape(-1)
 
-    source_fn = np.array([blackbody(t, wls.all_wls) for t in atm.temp])
+    _T = jnp.asarray(atm.temp)[:, None]
+    _wl = jnp.asarray(wls.all_wls)[None, :]
+    source_fn = np.asarray(blackbody(_T, _wl))
 
     cntm = None
     if return_cntm:
@@ -507,7 +539,8 @@ def synthesize(atm, linelist: Linelist, A_X, *wavelength_params,
     if hydrogen_lines:
         nH_I_vals = number_densities.get(H_I, np.zeros(n_layers, dtype=float))
         nHe_I_vals = number_densities.get(He_I, np.zeros(n_layers, dtype=float))
-        U_H_I_vals = np.array([partition_funcs[Species(Formula.from_Z(1), 0)](math.log(t)) for t in atm.temp])
+        _pf_H_I = partition_funcs[Species(Formula.from_Z(1), 0)]
+        U_H_I_vals = np.asarray(_pf_H_I.batch(jnp.log(jnp.asarray(atm.temp))))
         xi_vals = (vmic if np.isscalar(vmic) else np.asarray(vmic)) * 1e5
         h_alpha = hydrogen_line_absorption_layers(
             wls.all_wls, atm.temp, n_e_vals, nH_I_vals, nHe_I_vals, U_H_I_vals,
@@ -521,10 +554,12 @@ def synthesize(atm, linelist: Linelist, A_X, *wavelength_params,
     n_abs_matrix = _build_n_abs_matrix(
         n_dicts, unique_species, line_species_idx, partition_funcs, atm.temp
     )
-    alpha_cntm_at_lines = np.vstack([
-        np.interp(linelist.wl, wls.all_wls, alpha_cntm)
-        for alpha_cntm in alpha_cntm_funcs
-    ]) if linelist.n_lines > 0 else np.zeros((n_layers, 0), dtype=float)
+    # Vectorised: interpolate all layers simultaneously instead of one at a time
+    alpha_cntm_at_lines = (
+        _batch_interp(linelist.wl, wls.all_wls, alpha_np)
+        if linelist.n_lines > 0
+        else np.zeros((n_layers, 0), dtype=float)
+    )
     nH_I_vals = number_densities.get(H_I, np.zeros(n_layers, dtype=float))
 
     alpha_lines = line_absorption_layers(

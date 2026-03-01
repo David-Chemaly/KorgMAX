@@ -10,12 +10,30 @@ from __future__ import annotations
 
 import math
 import numpy as np
+import jax
+import jax.numpy as jnp
 
 from .constants import (
     kboltz_cgs, kboltz_eV, hplanck_cgs, electron_mass_cgs,
     bohr_radius_cgs, RydbergH_eV, eV_to_cgs, electron_charge_cgs,
 )
 from .atomic_data import MAX_ATOMIC_NUMBER
+from .cubic_splines import cubic_spline_eval
+
+
+@jax.jit
+def _eval_pf_batch(t_all, u_all, h_all, z_all, x):
+    """Evaluate N cubic splines at the same scalar point x.
+
+    Args:
+        t_all, u_all, h_all, z_all: (N, n_knots) stacked spline arrays.
+        x: scalar evaluation point.
+    Returns:
+        (N,) array of spline values.
+    """
+    return jax.vmap(
+        lambda t, u, h, z: cubic_spline_eval(t, u, h, z, x)
+    )(t_all, u_all, h_all, z_all)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
@@ -73,6 +91,28 @@ class _ChemEqContext:
         self.pf_II = [partition_funcs[s] for s in self.species_II]
         self.pf_III = [partition_funcs.get(s) for s in self.species_III]
 
+        # Stacked JAX arrays for batch partition function evaluation.
+        # All 92 neutral/ionised splines share the same knot count, so we can
+        # stack them into (92, n_knots) tensors and evaluate with a single vmap.
+        self.pf_I_t = jnp.stack([pf.t for pf in self.pf_I])
+        self.pf_I_u = jnp.stack([pf.u for pf in self.pf_I])
+        self.pf_I_h = jnp.stack([pf.h for pf in self.pf_I])
+        self.pf_I_z = jnp.stack([pf.z for pf in self.pf_I])
+
+        self.pf_II_t = jnp.stack([pf.t for pf in self.pf_II])
+        self.pf_II_u = jnp.stack([pf.u for pf in self.pf_II])
+        self.pf_II_h = jnp.stack([pf.h for pf in self.pf_II])
+        self.pf_II_z = jnp.stack([pf.z for pf in self.pf_II])
+
+        # pf_III is None for H (Z=1); substitute pf_II[0] as a harmless placeholder.
+        pf_III_safe = [p if p is not None else self.pf_II[0] for p in self.pf_III]
+        self.pf_III_t = jnp.stack([pf.t for pf in pf_III_safe])
+        self.pf_III_u = jnp.stack([pf.u for pf in pf_III_safe])
+        self.pf_III_h = jnp.stack([pf.h for pf in pf_III_safe])
+        self.pf_III_z = jnp.stack([pf.z for pf in pf_III_safe])
+        # Mask: True where pf_III is valid (False for H)
+        self.has_pf_III = jnp.array([p is not None for p in self.pf_III])
+
         # Ionization energies as flat arrays
         self.chi_I = np.array(
             [ionization_energies[Z][0] for Z in range(1, MAX_ATOMIC_NUMBER + 1)],
@@ -105,6 +145,30 @@ class _ChemEqContext:
         self.mol_charges = mol_charges
         self.mol_atom_counts = mol_atom_counts
         self.lec_fns = lec_fns
+
+        # Split lec_fns into CubicSpline (can be batch-vmapped) and plain
+        # callables (must fall back to a Python loop).  Group CubicSpline ones
+        # by knot count so each group needs only one vmap call.
+        from .cubic_splines import CubicSpline as _CubicSpline
+        spline_by_nc = {}
+        self.lec_scalar_indices = []  # plain-function indices
+        for i, fn in enumerate(lec_fns):
+            if isinstance(fn, _CubicSpline):
+                nc = len(fn.t)
+                spline_by_nc.setdefault(nc, []).append(i)
+            else:
+                self.lec_scalar_indices.append(i)
+
+        self.lec_groups = []
+        for nc, idxs in sorted(spline_by_nc.items()):
+            idxs_arr = np.array(idxs, dtype=np.int32)
+            self.lec_groups.append({
+                "indices": idxs_arr,
+                "t": jnp.stack([lec_fns[i].t for i in idxs]),
+                "u": jnp.stack([lec_fns[i].u for i in idxs]),
+                "h": jnp.stack([lec_fns[i].h for i in idxs]),
+                "z": jnp.stack([lec_fns[i].z for i in idxs]),
+            })
 
         # Pre-compute masks for vectorized residual
         self.mol_active = mol_atom_Z > 0                          # (n_mol, 6)
@@ -229,26 +293,33 @@ def _solve_layer(ctx, T, n_tot, model_ne):
     transU = translational_U(electron_mass_cgs, T)
     kT = kboltz_eV * T
 
-    # Saha weights at ne=1 (use pre-extracted partition functions)
-    wII_ne = np.empty(MAX_ATOMIC_NUMBER, dtype=np.float64)
-    wIII_ne2 = np.zeros(MAX_ATOMIC_NUMBER, dtype=np.float64)
+    # Saha weights at ne=1 — evaluate all 92 partition functions in one vmap.
+    logT_jax = jnp.float64(logT)
+    UI_all  = np.asarray(_eval_pf_batch(ctx.pf_I_t,   ctx.pf_I_u,   ctx.pf_I_h,   ctx.pf_I_z,   logT_jax))
+    UII_all = np.asarray(_eval_pf_batch(ctx.pf_II_t,  ctx.pf_II_u,  ctx.pf_II_h,  ctx.pf_II_z,  logT_jax))
+    UIII_all= np.asarray(_eval_pf_batch(ctx.pf_III_t, ctx.pf_III_u, ctx.pf_III_h, ctx.pf_III_z, logT_jax))
 
-    for idx in range(MAX_ATOMIC_NUMBER):
-        UI = ctx.pf_I[idx](logT)
-        UII = ctx.pf_II[idx](logT)
-        wII = 2.0 * (UII / UI) * transU * math.exp(-ctx.chi_I[idx] / kT)
-        wII_ne[idx] = wII
-        pf3 = ctx.pf_III[idx]
-        if pf3 is not None:
-            UIII = pf3(logT)
-            wIII_ne2[idx] = wII * 2.0 * (UIII / UII) * transU * math.exp(-ctx.chi_II[idx] / kT)
+    exp_chi_I  = np.exp(-ctx.chi_I  / kT)
+    exp_chi_II = np.exp(-ctx.chi_II / kT)
 
-    # Compute log_nKs (only T-dependent quantity for molecules)
+    wII_ne   = 2.0 * (UII_all / UI_all) * transU * exp_chi_I
+    wIII_ne2 = np.where(
+        np.asarray(ctx.has_pf_III),
+        wII_ne * 2.0 * (UIII_all / UII_all) * transU * exp_chi_II,
+        0.0,
+    )
+
+    # Compute log_nKs — CubicSpline molecules use batched vmap (one call per
+    # knot-count group); the small number of plain-function molecules fall back
+    # to individual Python calls.
     log_kT = math.log10(kboltz_cgs * T)
     log_nKs = np.empty(ctx.n_mol, dtype=np.float64)
-    for i in range(ctx.n_mol):
-        log_pK = float(ctx.lec_fns[i](logT))
-        log_nKs[i] = log_pK - (ctx.mol_atom_counts[i] - 1) * log_kT
+    for grp in ctx.lec_groups:
+        log_pKs = np.asarray(_eval_pf_batch(grp["t"], grp["u"], grp["h"], grp["z"], logT_jax))
+        idxs = grp["indices"]
+        log_nKs[idxs] = log_pKs - (ctx.mol_atom_counts[idxs] - 1) * log_kT
+    for i in ctx.lec_scalar_indices:
+        log_nKs[i] = float(ctx.lec_fns[i](logT)) - (ctx.mol_atom_counts[i] - 1) * log_kT
 
     # Initial guess from Saha weights
     wII_model = wII_ne / model_ne
@@ -344,9 +415,13 @@ def chemical_equilibrium(T, n_tot, model_ne, absolute_abundances,
 # ── Hummer-Mihalas occupation probability ────────────────────────────────
 
 def hummer_mihalas_w(T, n_eff, nH, nHe, ne):
-    """MHD occupation probability *w* for a hydrogen level."""
-    r_level = math.sqrt(2.5 * n_eff ** 4 + 0.5 * n_eff ** 2) * bohr_radius_cgs
-    neutral_term = (nH * (r_level + math.sqrt(3) * bohr_radius_cgs) ** 3
+    """MHD occupation probability *w* for a hydrogen level.
+
+    n_eff is a scalar (quantum number).  T/nH/nHe/ne may be scalar or array;
+    the return value has the same shape as the broadcast of those inputs.
+    """
+    r_level = np.sqrt(2.5 * n_eff ** 4 + 0.5 * n_eff ** 2) * bohr_radius_cgs
+    neutral_term = (nH * (r_level + np.sqrt(3.0) * bohr_radius_cgs) ** 3
                     + nHe * (r_level + 1.02 * bohr_radius_cgs) ** 3)
     K = 1.0
     if n_eff > 3:
@@ -355,8 +430,8 @@ def hummer_mihalas_w(T, n_eff, nH, nHe, ne):
              * ((n_eff + 7.0 / 6.0) / (n_eff ** 2 + n_eff + 0.5)))
     chi = RydbergH_eV / n_eff ** 2 * eV_to_cgs
     e = electron_charge_cgs
-    charged_term = 16.0 * ((e ** 2) / (chi * math.sqrt(K))) ** 3 * ne
-    return math.exp(-4.0 * math.pi / 3.0 * (neutral_term + charged_term))
+    charged_term = 16.0 * ((e ** 2) / (chi * np.sqrt(K))) ** 3 * ne
+    return np.exp(-4.0 * np.pi / 3.0 * (neutral_term + charged_term))
 
 
 def hummer_mihalas_w_vec(T, n_eff, nH, nHe, ne):
@@ -374,4 +449,31 @@ def hummer_mihalas_w_vec(T, n_eff, nH, nHe, ne):
     chi = RydbergH_eV / n_eff ** 2 * eV_to_cgs
     e = electron_charge_cgs
     charged_term = 16.0 * ((e ** 2) / (chi * np.sqrt(K))) ** 3 * ne
+    return np.exp(-4.0 * np.pi / 3.0 * (neutral_term + charged_term))
+
+
+def hummer_mihalas_w_layers(T, n_eff, nH, nHe, ne):
+    """MHD occupation probability broadcast over layers and frequencies.
+
+    T/nH/nHe/ne: (n_layers,) arrays
+    n_eff: (n_freq,) array of effective quantum numbers
+    Returns: (n_layers, n_freq)
+    """
+    n_eff = np.asarray(n_eff, dtype=np.float64)           # (n_freq,)
+    nH  = np.asarray(nH,  dtype=np.float64)[:, np.newaxis]  # (n_layers, 1)
+    nHe = np.asarray(nHe, dtype=np.float64)[:, np.newaxis]
+    ne  = np.asarray(ne,  dtype=np.float64)[:, np.newaxis]
+
+    r_level = np.sqrt(2.5 * n_eff ** 4 + 0.5 * n_eff ** 2) * bohr_radius_cgs  # (n_freq,)
+    neutral_term = (nH  * (r_level + np.sqrt(3.0) * bohr_radius_cgs) ** 3
+                  + nHe * (r_level + 1.02             * bohr_radius_cgs) ** 3)  # (n_layers, n_freq)
+    K = np.where(
+        n_eff > 3,
+        16.0 / 3.0 * (n_eff / (n_eff + 1)) ** 2
+        * ((n_eff + 7.0 / 6.0) / (n_eff ** 2 + n_eff + 0.5)),
+        1.0,
+    )                                                       # (n_freq,)
+    chi = RydbergH_eV / n_eff ** 2 * eV_to_cgs            # (n_freq,)
+    e = electron_charge_cgs
+    charged_term = 16.0 * ((e ** 2) / (chi * np.sqrt(K))) ** 3 * ne  # (n_layers, n_freq)
     return np.exp(-4.0 * np.pi / 3.0 * (neutral_term + charged_term))

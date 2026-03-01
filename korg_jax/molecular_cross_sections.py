@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 import numpy as np
+import jax
 import jax.numpy as jnp
 from dataclasses import dataclass
 
@@ -138,18 +139,29 @@ def interpolate_molecular_cross_sections(alpha, molecular_cross_sections, wls, T
         return alpha
 
     wls = Wavelengths(wls) if not isinstance(wls, Wavelengths) else wls
-    Ts = np.asarray(Ts)
-    vmic_vals = vmic
+    Ts = jnp.asarray(Ts)
+    logTs = jnp.log10(Ts)                                         # (n_layers,)
+    wl_jax = jnp.asarray(wls.all_wls)
     out = alpha
 
     for sigma in molecular_cross_sections:
-        for i in range(alpha.shape[0]):
-            vm = vmic_vals if np.isscalar(vmic_vals) else vmic_vals[i]
-            logT = np.log10(Ts[i])
-            vals = _trilinear_interp(vm, logT, wls.all_wls,
-                                     sigma.vmic_vals, sigma.log_temp_vals, sigma.wls.all_wls,
-                                     sigma.values)
-            out = out.at[i, :].add(vals * number_densities[sigma.species][i])
+        sv = jnp.asarray(sigma.vmic_vals)
+        st = jnp.asarray(sigma.log_temp_vals)
+        sw = jnp.asarray(sigma.wls.all_wls)
+        stab = jnp.asarray(sigma.values)
+        nd = jnp.asarray(number_densities[sigma.species])         # (n_layers,)
+
+        if np.isscalar(vmic):
+            vm_jax = jnp.full(Ts.shape, float(vmic))
+        else:
+            vm_jax = jnp.asarray(vmic)
+
+        # Vectorise over atmosphere layers — each call returns (n_wl,)
+        vals_all = jax.vmap(
+            lambda vm_i, logT_i: _trilinear_interp(vm_i, logT_i, wl_jax, sv, st, sw, stab)
+        )(vm_jax, logTs)                                           # (n_layers, n_wl)
+
+        out = out + vals_all * nd[:, None]
 
     return out
 
